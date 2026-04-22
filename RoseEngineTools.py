@@ -76,10 +76,12 @@ class RosetteSvgViewer(tk.Tk):
         gcode_tab    = ttk.Frame(notebook)
         serial_tab     = ttk.Frame(notebook)
         reciprocator_tab = ttk.Frame(notebook)
+        plunge_tab = ttk.Frame(notebook)
         settings_tab = ttk.Frame(notebook)
 
         notebook.add(svg_tab,      text="Rosette")
         notebook.add(reciprocator_tab, text="Reciprocator")
+        notebook.add(plunge_tab, text="Plunge")
         notebook.add(gcode_tab,    text="gCode Gen")
         notebook.add(serial_tab,     text="Serial Terminal")
         notebook.add(settings_tab, text="Settings")
@@ -88,11 +90,60 @@ class RosetteSvgViewer(tk.Tk):
         self._build_gcode_tab(gcode_tab)
         self._build_serial_tab(serial_tab)
         self._build_reciprocator_tab(reciprocator_tab)
+        self._build_plunge_tab(plunge_tab)
         self._build_settings_tab(settings_tab)
 
     def _build_placeholder_tab(self, parent, name):
         ttk.Label(parent, text=f"{name} — coming soon", font=("TkDefaultFont", 11)).pack(
             expand=True
+        )
+
+    def _build_plunge_tab(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        controls = ttk.LabelFrame(frame, text="Plunge Controls", padding=10)
+        controls.pack(anchor=tk.NW, fill=tk.X)
+
+        def add_labeled_entry(parent_widget, label_text, text_var, pady=(10, 0)):
+            row = ttk.Frame(parent_widget)
+            row.pack(fill=tk.X, pady=pady)
+            ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=text_var, width=14).pack(side=tk.RIGHT)
+
+        self.plunge_total_depth_var = tk.StringVar(value="1.0")
+        add_labeled_entry(controls, "Total depth", self.plunge_total_depth_var, pady=(0, 0))
+
+        self.plunge_step_depth_var = tk.StringVar(value="0.1")
+        add_labeled_entry(controls, "Step depth", self.plunge_step_depth_var)
+
+        self.plunge_retract_depth_var = tk.StringVar(value="0.2")
+        add_labeled_entry(controls, "Retract depth", self.plunge_retract_depth_var)
+
+        self.plunge_safe_z_var = tk.StringVar(value="4.0")
+        add_labeled_entry(controls, "Safe Z", self.plunge_safe_z_var)
+
+        self.plunge_x_advance_var = tk.StringVar(value="1.0")
+        add_labeled_entry(controls, "X advance", self.plunge_x_advance_var)
+
+        self.plunge_number_of_cuts_var = tk.StringVar(value="10")
+        add_labeled_entry(controls, "Number of cuts", self.plunge_number_of_cuts_var)
+
+        self.plunge_feedrate_var = tk.StringVar(value="200")
+        add_labeled_entry(controls, "Feedrate", self.plunge_feedrate_var)
+
+        self.plunge_number_of_divisions_var = tk.StringVar(value="1")
+        add_labeled_entry(controls, "Number of divisions", self.plunge_number_of_divisions_var)
+
+        self.plunge_rotate_repeat_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Rotate & Repeat",
+            variable=self.plunge_rotate_repeat_var,
+        ).pack(anchor=tk.W, pady=(10, 0))
+
+        ttk.Button(controls, text="Generate gCode", command=self._on_generate_plunge_gcode).pack(
+            fill=tk.X, pady=(12, 0)
         )
 
     def _build_reciprocator_tab(self, parent):
@@ -580,6 +631,87 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.insert(tk.END, output)
         self.gcode_text.config(state=tk.DISABLED)
 
+    def _on_generate_plunge_gcode(self):
+        try:
+            total_depth = float(self.plunge_total_depth_var.get())
+            step_depth = float(self.plunge_step_depth_var.get())
+            retract_depth = float(self.plunge_retract_depth_var.get())
+            safe_z = float(self.plunge_safe_z_var.get())
+            x_advance = float(self.plunge_x_advance_var.get())
+            number_of_cuts = int(self.plunge_number_of_cuts_var.get())
+            feedrate = float(self.plunge_feedrate_var.get())
+            division_count = int(self.plunge_number_of_divisions_var.get())
+            if (
+                total_depth <= 0.0
+                or step_depth <= 0.0
+                or retract_depth < 0.0
+                or safe_z < 0.0
+                or x_advance < 0.0
+                or number_of_cuts < 1
+                or feedrate <= 0.0
+                or division_count < 1
+            ):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Plunge Input",
+                "Total depth and step depth must be positive. Retract depth, safe Z, and X advance must be zero or greater. Number of cuts, feedrate, and number of divisions must be positive.",
+            )
+            return
+
+        rotate_repeat = self.plunge_rotate_repeat_var.get()
+        cut_iterations = division_count if rotate_repeat else 1
+        division_angle = 360.0 / float(division_count)
+        depth_levels = []
+        current_depth = step_depth
+        while current_depth < total_depth:
+            depth_levels.append(current_depth)
+            current_depth += step_depth
+        depth_levels.append(total_depth)
+
+        lines = [
+            "; Plunge cut program",
+            "G21 ; mm units",
+            "G90 ; absolute positioning",
+            "M3 S100",
+            f"; total_depth_mm={total_depth:.4f}",
+            f"; step_depth_mm={step_depth:.4f}",
+            f"; retract_depth_mm={retract_depth:.4f}",
+            f"; safe_z_mm={safe_z:.4f}",
+            f"; x_advance_mm={x_advance:.4f}",
+            f"; number_of_cuts={number_of_cuts}",
+            f"; feedrate={feedrate:.4f}",
+            f"; rotate_repeat={rotate_repeat} divisions={division_count}",
+            "G0 X0.0000 A0.0000 Z0.0000",
+        ]
+
+        for iteration in range(cut_iterations):
+            division_angle_target = iteration * division_angle if rotate_repeat else 0.0
+            lines.append(f"; cut group {iteration + 1} of {cut_iterations}")
+            lines.append(f"G0 A{division_angle_target:.4f}")
+
+            for cut_index in range(number_of_cuts):
+                x_target = cut_index * x_advance
+                lines.append(f"G0 Z{safe_z:.4f}")
+                lines.append(f"G0 X{x_target:.4f}")
+                lines.append("G0 Z0.0000")
+                for plunge_depth in depth_levels:
+                    lines.append(f"G1 Z{-plunge_depth:.4f} F{feedrate:.4f}")
+                    lines.append(f"G0 Z{retract_depth:.4f}")
+
+            lines.append(f"G0 Z{safe_z:.4f}")
+            lines.append("G0 X0.0000")
+            lines.append("G0 Z0.0000")
+
+        lines.append("M5")
+        lines.append("M2")
+        output = "\n".join(lines) + "\n"
+
+        self.gcode_text.config(state=tk.NORMAL)
+        self.gcode_text.delete("1.0", tk.END)
+        self.gcode_text.insert(tk.END, output)
+        self.gcode_text.config(state=tk.DISABLED)
+
     def _build_serial_tab(self, parent):
         frame = ttk.Frame(parent, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -814,8 +946,8 @@ class RosetteSvgViewer(tk.Tk):
         toolbar = ttk.Frame(parent, padding=(6, 6, 6, 0))
         toolbar.pack(fill=tk.X)
 
-        gen_btn = ttk.Button(toolbar, text="Generate", command=self._on_generate_gcode)
-        gen_btn.pack(side=tk.LEFT)
+        save_btn = ttk.Button(toolbar, text="Save", command=self._on_save_gcode)
+        save_btn.pack(side=tk.LEFT)
 
         clear_btn = ttk.Button(toolbar, text="Clear", command=self._on_clear_gcode)
         clear_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -879,6 +1011,9 @@ class RosetteSvgViewer(tk.Tk):
 
         sample_btn = ttk.Button(left_panel, text="Sample", command=self._on_sample)
         sample_btn.pack(fill=tk.X)
+
+        gen_btn = ttk.Button(left_panel, text="Generate gCode", command=self._on_generate_gcode)
+        gen_btn.pack(fill=tk.X, pady=(8, 0))
 
         ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 8))
 
@@ -1017,6 +1152,28 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
         self.gcode_text.config(state=tk.DISABLED)
+
+    def _on_save_gcode(self):
+        output = self.gcode_text.get("1.0", tk.END)
+        if not output.strip():
+            messagebox.showwarning("Save gCode", "There is no gCode to save.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Save gCode",
+            defaultextension=".nc",
+            filetypes=[
+                ("G-code files", "*.nc *.gcode *.tap *.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        try:
+            Path(file_path).write_text(output, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Save Error", f"Unable to save gCode: {exc}")
 
     def _append_serial_terminal(self, text):
         self.serial_terminal.config(state=tk.NORMAL)
