@@ -77,11 +77,13 @@ class RosetteSvgViewer(tk.Tk):
         serial_tab     = ttk.Frame(notebook)
         reciprocator_tab = ttk.Frame(notebook)
         plunge_tab = ttk.Frame(notebook)
+        spherical_sliderest_tab = ttk.Frame(notebook)
         settings_tab = ttk.Frame(notebook)
 
         notebook.add(svg_tab,      text="Rosette")
         notebook.add(reciprocator_tab, text="Reciprocator")
         notebook.add(plunge_tab, text="Plunge")
+        notebook.add(spherical_sliderest_tab, text="Spherical Sliderest")
         notebook.add(gcode_tab,    text="gCode Gen")
         notebook.add(serial_tab,     text="Serial Terminal")
         notebook.add(settings_tab, text="Settings")
@@ -91,6 +93,7 @@ class RosetteSvgViewer(tk.Tk):
         self._build_serial_tab(serial_tab)
         self._build_reciprocator_tab(reciprocator_tab)
         self._build_plunge_tab(plunge_tab)
+        self._build_spherical_sliderest_tab(spherical_sliderest_tab)
         self._build_settings_tab(settings_tab)
 
     def _build_placeholder_tab(self, parent, name):
@@ -145,6 +148,187 @@ class RosetteSvgViewer(tk.Tk):
         ttk.Button(controls, text="Generate gCode", command=self._on_generate_plunge_gcode).pack(
             fill=tk.X, pady=(12, 0)
         )
+
+    def _build_spherical_sliderest_tab(self, parent):
+        frame = ttk.Frame(parent, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        controls = ttk.LabelFrame(frame, text="Spherical Slide Rest Controls", padding=10, width=320)
+        controls.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        controls.grid_propagate(False)
+
+        def add_labeled_entry(parent_widget, label_text, text_var, pady=(10, 0)):
+            row = ttk.Frame(parent_widget)
+            row.pack(fill=tk.X, pady=pady)
+            ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=text_var, width=14).pack(side=tk.RIGHT)
+
+        self.spherical_b_start_var = tk.StringVar(value="0")
+        add_labeled_entry(controls, "B starting angle", self.spherical_b_start_var, pady=(0, 0))
+
+        self.spherical_b_end_var = tk.StringVar(value="90")
+        add_labeled_entry(controls, "B ending angle", self.spherical_b_end_var)
+
+        self.spherical_radius_var = tk.StringVar(value="10")
+        add_labeled_entry(controls, "Radius", self.spherical_radius_var)
+
+        self.spherical_samples_var = tk.StringVar(value="91")
+        add_labeled_entry(controls, "Samples", self.spherical_samples_var)
+
+        ttk.Label(controls, text="Direction").pack(anchor=tk.W, pady=(10, 0))
+        self.spherical_direction_var = tk.StringVar(value="L-R")
+        direction_frame = ttk.Frame(controls)
+        direction_frame.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Radiobutton(
+            direction_frame,
+            text="L-R",
+            value="L-R",
+            variable=self.spherical_direction_var,
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            direction_frame,
+            text="R-L",
+            value="R-L",
+            variable=self.spherical_direction_var,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.spherical_curve_inverted_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Invert Curve (XZ diagonal)",
+            variable=self.spherical_curve_inverted_var,
+            command=self._update_spherical_sliderest_preview,
+        ).pack(anchor=tk.W, pady=(10, 0))
+
+        self.spherical_suppress_b_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Suppress B axis move",
+            variable=self.spherical_suppress_b_var,
+        ).pack(anchor=tk.W, pady=(10, 0))
+
+        self.spherical_depth_of_cut_var = tk.StringVar(value="0.1")
+        add_labeled_entry(controls, "Depth of cut", self.spherical_depth_of_cut_var)
+
+        self.spherical_feedrate_var = tk.StringVar(value="200")
+        add_labeled_entry(controls, "Feedrate", self.spherical_feedrate_var)
+
+        ttk.Button(
+            controls,
+            text="Generate gCode",
+            command=self._on_generate_spherical_sliderest_gcode,
+        ).pack(fill=tk.X, pady=(12, 0))
+
+        preview_frame = ttk.LabelFrame(frame, text="Arc Preview", padding=8)
+        preview_frame.grid(row=0, column=1, sticky="nsew")
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_frame.grid_columnconfigure(0, weight=1)
+
+        self.spherical_figure = Figure(figsize=(6, 5), dpi=100)
+        self.spherical_ax = self.spherical_figure.add_subplot(111)
+        self.spherical_canvas = FigureCanvasTkAgg(self.spherical_figure, master=preview_frame)
+        self.spherical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        for variable in (
+            self.spherical_b_start_var,
+            self.spherical_b_end_var,
+            self.spherical_radius_var,
+            self.spherical_samples_var,
+            self.spherical_depth_of_cut_var,
+        ):
+            variable.trace_add("write", self._update_spherical_sliderest_preview)
+        self.spherical_direction_var.trace_add("write", self._update_spherical_sliderest_preview)
+        self._update_spherical_sliderest_preview()
+
+    def _get_spherical_sliderest_parameters(self):
+        start_angle = float(self.spherical_b_start_var.get())
+        end_angle = float(self.spherical_b_end_var.get())
+        radius = float(self.spherical_radius_var.get())
+        depth_of_cut = float(self.spherical_depth_of_cut_var.get())
+        feedrate = float(self.spherical_feedrate_var.get())
+        sample_count = int(self.spherical_samples_var.get())
+        if radius <= 0.0 or depth_of_cut < 0.0 or feedrate <= 0.0 or sample_count < 2:
+            raise ValueError
+        direction = self.spherical_direction_var.get()
+        x_sign = 1.0 if direction == "L-R" else -1.0
+        return start_angle, end_angle, radius, depth_of_cut, feedrate, sample_count, direction, x_sign
+
+    def _build_spherical_sliderest_samples(
+        self,
+        start_angle,
+        end_angle,
+        radius,
+        depth_of_cut,
+        sample_count,
+        x_sign,
+        invert_curve,
+    ):
+        sweep_deg = end_angle - start_angle
+        start_angle_rad = math.radians(start_angle)
+        samples = []
+        for index in range(sample_count):
+            fraction = index / float(sample_count - 1)
+            current_angle = start_angle + sweep_deg * fraction
+            current_angle_rad = math.radians(current_angle)
+            x_arc_delta = x_sign * radius * (math.cos(current_angle_rad) - math.cos(start_angle_rad))
+            z_arc_delta = radius * (math.sin(current_angle_rad) - math.sin(start_angle_rad))
+            if invert_curve:
+                x_arc_delta, z_arc_delta = z_arc_delta, x_arc_delta
+            x_target = x_arc_delta
+            z_target = -depth_of_cut + z_arc_delta
+            samples.append((current_angle, x_target, z_target))
+        return samples
+
+    def _update_spherical_sliderest_preview(self, *_):
+        self.spherical_ax.clear()
+        self.spherical_ax.set_title("Spherical Slide Rest Path")
+        self.spherical_ax.set_xlabel("X (mm)")
+        self.spherical_ax.set_ylabel("Z (mm)")
+        self.spherical_ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
+
+        try:
+            start_angle, end_angle, radius, depth_of_cut, _feedrate, sample_count, direction, x_sign = (
+                self._get_spherical_sliderest_parameters()
+            )
+            samples = self._build_spherical_sliderest_samples(
+                start_angle,
+                end_angle,
+                radius,
+                depth_of_cut,
+                sample_count,
+                x_sign,
+                self.spherical_curve_inverted_var.get(),
+            )
+            x_values = [sample[1] for sample in samples]
+            z_values = [sample[2] for sample in samples]
+            self.spherical_ax.plot(x_values, z_values, color="#1f77b4", linewidth=1.8)
+            self.spherical_ax.scatter([x_values[0]], [z_values[0]], color="#2ca02c", label="Start", zorder=3)
+            self.spherical_ax.scatter([x_values[-1]], [z_values[-1]], color="#d62728", label="End", zorder=3)
+            self.spherical_ax.set_aspect("equal", adjustable="box")
+            self.spherical_ax.legend(loc="best")
+            self.spherical_ax.text(
+                0.02,
+                0.02,
+                f"B {start_angle:.1f}° -> {end_angle:.1f}°\n{direction}, {sample_count} samples",
+                transform=self.spherical_ax.transAxes,
+                va="bottom",
+                ha="left",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": "#bbbbbb"},
+            )
+        except Exception:
+            self.spherical_ax.text(
+                0.5,
+                0.5,
+                "Enter valid spherical sliderest values\n(samples must be 2 or more)",
+                transform=self.spherical_ax.transAxes,
+                ha="center",
+                va="center",
+            )
+
+        self.spherical_canvas.draw_idle()
 
     def _build_reciprocator_tab(self, parent):
         body = ttk.Frame(parent, padding=(6, 6, 6, 6))
@@ -570,32 +754,7 @@ class RosetteSvgViewer(tk.Tk):
             f"; repeat_cut={self.reciprocator_repeat_cut_var.get()} divisions={division_count}",
             "G0 X0.0000 A0.0000",
         ]
-
-        cut_macro_lines = [
-            "O1000",
-            "G91",
-        ]
-
         start_a = float(a_samples[0]) if len(a_samples) else 0.0
-        if abs(start_a) > 1e-9:
-            cut_macro_lines.append(f"G0 A{start_a:.4f}")
-
-        cut_macro_lines.append(f"G1 Z{-depth_of_cut:.4f} F{feedrate:.4f}")
-
-        previous_x = 0.0
-        previous_a = start_a
-        for x_val, a_val in zip(x_samples, a_samples):
-            current_x = x_sign * float(x_val)
-            current_a = float(a_val)
-            delta_x = current_x - previous_x
-            delta_a = current_a - previous_a
-            if abs(delta_x) > 1e-9 or abs(delta_a) > 1e-9:
-                cut_macro_lines.append(f"G1 X{delta_x:.4f} A{delta_a:.4f} F{feedrate:.4f}")
-            previous_x = current_x
-            previous_a = current_a
-
-        cut_macro_lines.append("G90")
-        cut_macro_lines.append("M99")
 
         cut_iterations = division_count if self.reciprocator_repeat_cut_var.get() else 1
         division_angle = 360.0 / float(division_count)
@@ -605,7 +764,19 @@ class RosetteSvgViewer(tk.Tk):
             division_base_angle = iteration * division_angle if self.reciprocator_repeat_cut_var.get() else 0.0
             next_division_angle = (iteration + 1) * division_angle
             lines.append(f"; cut iteration {iteration + 1} of {cut_iterations}")
-            lines.append("M98 P1000")
+
+            lines.append("G0 X0.0000")
+            lines.append(f"G0 A{division_base_angle:.4f}")
+            if abs(start_a) > 1e-9:
+                lines.append(f"G0 A{division_base_angle + start_a:.4f}")
+
+            lines.append(f"G1 Z{-depth_of_cut:.4f} F{feedrate:.4f}")
+
+            for x_val, a_val in zip(x_samples, a_samples):
+                current_x = x_sign * float(x_val)
+                current_a = division_base_angle + float(a_val)
+                lines.append(f"G1 X{current_x:.4f} A{current_a:.4f} F{feedrate:.4f}")
+
             lines.append(f"G1 Z{pulloff_mm:.4f} F{feedrate:.4f}")
 
             if should_return_x:
@@ -623,7 +794,6 @@ class RosetteSvgViewer(tk.Tk):
         lines.append("M2")
 
         lines.append(f"; points: {len(x_samples)}")
-        lines.extend(cut_macro_lines)
         output = "\n".join(lines) + "\n"
 
         self.gcode_text.config(state=tk.NORMAL)
@@ -712,6 +882,60 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.insert(tk.END, output)
         self.gcode_text.config(state=tk.DISABLED)
 
+    def _on_generate_spherical_sliderest_gcode(self):
+        try:
+            start_angle, end_angle, radius, depth_of_cut, feedrate, sample_count, direction, x_sign = (
+                self._get_spherical_sliderest_parameters()
+            )
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Spherical Sliderest Input",
+                "Radius and feedrate must be positive. Depth of cut must be zero or greater. Samples must be 2 or more.",
+            )
+            return
+
+        samples = self._build_spherical_sliderest_samples(
+            start_angle,
+            end_angle,
+            radius,
+            depth_of_cut,
+            sample_count,
+            x_sign,
+            self.spherical_curve_inverted_var.get(),
+        )
+        suppress_b = self.spherical_suppress_b_var.get()
+
+        lines = [
+            "; Spherical sliderest cut",
+            "G21 ; mm units",
+            "G90 ; absolute positioning",
+            "M3 S100",
+            f"; b_start_deg={start_angle:.4f} b_end_deg={end_angle:.4f}",
+            f"; radius_mm={radius:.4f} depth_of_cut_mm={depth_of_cut:.4f}",
+            f"; direction={direction} x_sign={x_sign:+.0f}",
+            f"; curve_inverted_xz_diagonal={self.spherical_curve_inverted_var.get()}",
+            f"; feedrate={feedrate:.4f}",
+            f"; samples={sample_count}",
+            f"; suppress_b_axis_move={suppress_b}",
+            "; assumes X0 Z0 at cut start and B is already at starting angle",
+        ]
+
+        for current_angle, x_target, z_target in samples:
+            if suppress_b:
+                lines.append(f"G1 X{x_target:.4f} Z{z_target:.4f} F{feedrate:.4f}")
+            else:
+                lines.append(f"G1 X{x_target:.4f} Z{z_target:.4f} B{current_angle:.4f} F{feedrate:.4f}")
+
+        lines.append("M5")
+        lines.append("M2")
+        lines.append(f"; points: {len(samples)}")
+        output = "\n".join(lines) + "\n"
+
+        self.gcode_text.config(state=tk.NORMAL)
+        self.gcode_text.delete("1.0", tk.END)
+        self.gcode_text.insert(tk.END, output)
+        self.gcode_text.config(state=tk.DISABLED)
+
     def _build_serial_tab(self, parent):
         frame = ttk.Frame(parent, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -735,14 +959,58 @@ class RosetteSvgViewer(tk.Tk):
         self.connect_serial_btn = ttk.Button(toolbar, text="Connect", command=self._toggle_serial_connection)
         self.connect_serial_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.get_descriptions_btn = ttk.Button(
+            toolbar,
+            text="Get Descriptions",
+            command=self._get_descriptions,
+        )
+        self.get_descriptions_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.clear_serial_btn = ttk.Button(toolbar, text="Clear", command=self._clear_serial_terminal)
+        self.clear_serial_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.suppress_idle_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="Suppress Idle", variable=self.suppress_idle_var).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+
+        self.filter_ok_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="Filter OK", variable=self.filter_ok_var).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
         self.serial_status_var = tk.StringVar(value="Disconnected")
         ttk.Label(toolbar, textvariable=self.serial_status_var).pack(side=tk.LEFT, padx=(12, 0))
 
         body = ttk.Frame(frame)
         body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
+        terminal_frame = ttk.Frame(body)
+        terminal_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.serial_terminal = scrolledtext.ScrolledText(
+            terminal_frame,
+            state=tk.DISABLED,
+            wrap=tk.NONE,
+            font=("Courier", 10),
+        )
+        self.serial_terminal.pack(fill=tk.BOTH, expand=True)
+
+        send_row = ttk.Frame(terminal_frame)
+        send_row.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(send_row, text="Send:").pack(side=tk.LEFT)
+        self.serial_send_var = tk.StringVar(value="")
+        self.serial_send_entry = ttk.Entry(send_row, textvariable=self.serial_send_var)
+        self.serial_send_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.serial_send_entry.bind("<Return>", self._on_serial_send_return)
+
+        self.serial_send_btn = ttk.Button(send_row, text="Send", command=self._send_serial_text)
+        self.serial_send_btn.pack(side=tk.LEFT)
+        self._set_serial_send_enabled(False)
+
         left_panel = ttk.LabelFrame(body, text="Controls", padding=10, width=250)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         left_panel.pack_propagate(False)
 
         ttk.Label(left_panel, text="Jog Controls").pack(anchor=tk.W)
@@ -750,11 +1018,19 @@ class RosetteSvgViewer(tk.Tk):
         jog_frame = ttk.Frame(left_panel)
         jog_frame.pack(anchor=tk.N, pady=(12, 0))
 
-        ttk.Button(jog_frame, text="Z+", width=8).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(jog_frame, text="X-", width=8).grid(row=1, column=0, padx=4, pady=4)
+        ttk.Button(jog_frame, text="Z+", width=8, command=lambda: self._on_jog_axis("Z", +1)).grid(
+            row=0, column=1, padx=4, pady=4
+        )
+        ttk.Button(jog_frame, text="X-", width=8, command=lambda: self._on_jog_axis("X", -1)).grid(
+            row=1, column=0, padx=4, pady=4
+        )
         ttk.Label(jog_frame, text="XYZ").grid(row=1, column=1, padx=4, pady=4)
-        ttk.Button(jog_frame, text="X+", width=8).grid(row=1, column=2, padx=4, pady=4)
-        ttk.Button(jog_frame, text="Z-", width=8).grid(row=2, column=1, padx=4, pady=4)
+        ttk.Button(jog_frame, text="X+", width=8, command=lambda: self._on_jog_axis("X", +1)).grid(
+            row=1, column=2, padx=4, pady=4
+        )
+        ttk.Button(jog_frame, text="Z-", width=8, command=lambda: self._on_jog_axis("Z", -1)).grid(
+            row=2, column=1, padx=4, pady=4
+        )
 
         ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
         ttk.Label(left_panel, text="Jog Increment").pack(anchor=tk.W)
@@ -777,26 +1053,67 @@ class RosetteSvgViewer(tk.Tk):
         )
 
         ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
+        ttk.Label(left_panel, text="Jog Mode").pack(anchor=tk.W)
+
+        self.jog_mode_var = tk.StringVar(value="Rapid")
+        jog_mode_frame = ttk.Frame(left_panel)
+        jog_mode_frame.pack(anchor=tk.W, pady=(8, 0))
+
+        ttk.Radiobutton(jog_mode_frame, text="Rapid", value="Rapid", variable=self.jog_mode_var).grid(
+            row=0, column=0, padx=4, pady=2, sticky=tk.W
+        )
+        ttk.Radiobutton(jog_mode_frame, text="Fine", value="Fine", variable=self.jog_mode_var).grid(
+            row=0, column=1, padx=4, pady=2, sticky=tk.W
+        )
+
+        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
         ttk.Label(left_panel, text="Rotation").pack(anchor=tk.W)
 
         rotate_frame = ttk.Frame(left_panel)
         rotate_frame.pack(anchor=tk.N, pady=(8, 0))
 
-        ttk.Button(rotate_frame, text="A-", width=8).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(rotate_frame, text="A+", width=8).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(rotate_frame, text="B-", width=8).grid(row=1, column=0, padx=4, pady=4)
-        ttk.Button(rotate_frame, text="B+", width=8).grid(row=1, column=1, padx=4, pady=4)
-
-        terminal_frame = ttk.Frame(body)
-        terminal_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.serial_terminal = scrolledtext.ScrolledText(
-            terminal_frame,
-            state=tk.DISABLED,
-            wrap=tk.NONE,
-            font=("Courier", 10),
+        ttk.Button(rotate_frame, text="A-", width=8, command=lambda: self._on_jog_axis("A", -1)).grid(
+            row=0, column=0, padx=4, pady=4
         )
-        self.serial_terminal.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(rotate_frame, text="A+", width=8, command=lambda: self._on_jog_axis("A", +1)).grid(
+            row=0, column=1, padx=4, pady=4
+        )
+        ttk.Button(rotate_frame, text="B-", width=8, command=lambda: self._on_jog_axis("B", -1)).grid(
+            row=1, column=0, padx=4, pady=4
+        )
+        ttk.Button(rotate_frame, text="B+", width=8, command=lambda: self._on_jog_axis("B", +1)).grid(
+            row=1, column=1, padx=4, pady=4
+        )
+
+        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
+        ttk.Label(left_panel, text="Home").pack(anchor=tk.W)
+
+        self.home_axis_var = tk.StringVar(value="All")
+        home_frame = ttk.Frame(left_panel)
+        home_frame.pack(anchor=tk.W, pady=(8, 0))
+
+        ttk.Radiobutton(home_frame, text="X", value="X", variable=self.home_axis_var).grid(
+            row=0, column=0, padx=4, pady=2, sticky=tk.W
+        )
+        ttk.Radiobutton(home_frame, text="Z", value="Z", variable=self.home_axis_var).grid(
+            row=0, column=1, padx=4, pady=2, sticky=tk.W
+        )
+        ttk.Radiobutton(home_frame, text="A", value="A", variable=self.home_axis_var).grid(
+            row=1, column=0, padx=4, pady=2, sticky=tk.W
+        )
+        ttk.Radiobutton(home_frame, text="B", value="B", variable=self.home_axis_var).grid(
+            row=1, column=1, padx=4, pady=2, sticky=tk.W
+        )
+        ttk.Radiobutton(home_frame, text="All", value="All", variable=self.home_axis_var).grid(
+            row=2, column=0, columnspan=2, padx=4, pady=2, sticky=tk.W
+        )
+
+        ttk.Button(left_panel, text="Home", command=self._on_home_axis).pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
+        ttk.Label(left_panel, text="Zero").pack(anchor=tk.W)
+
+        ttk.Button(left_panel, text="Zero", command=self._on_zero_axis).pack(fill=tk.X, pady=(8, 0))
 
         if serial is None:
             self.serial_status_var.set("pyserial not installed")
@@ -834,14 +1151,20 @@ class RosetteSvgViewer(tk.Tk):
             row=2, column=1, sticky=tk.W, padx=(10, 0), pady=(8, 0)
         )
 
+        ttk.Label(form, text="Fine Jog Feedrate").grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
+        self.fine_jog_feed_var = tk.StringVar(value=f"{self._settings['fine_jog_feedrate']}")
+        ttk.Entry(form, textvariable=self.fine_jog_feed_var, width=14).grid(
+            row=3, column=1, sticky=tk.W, padx=(10, 0), pady=(8, 0)
+        )
+
         ttk.Checkbutton(
             form,
             text="Invert Z Direction",
             variable=self.invert_z_var,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
 
         save_btn = ttk.Button(form, text="Save Settings", command=self._on_save_settings)
-        save_btn.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+        save_btn.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
 
         self.settings_status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.settings_status_var, foreground="#2E6E3E").pack(
@@ -854,6 +1177,7 @@ class RosetteSvgViewer(tk.Tk):
             "angular_feedrate": 200.0,
             "z_feedrate": 200.0,
             "default_sample_count": 720,
+            "fine_jog_feedrate": 200.0,
             "invert_z_direction": False,
         }
 
@@ -867,23 +1191,33 @@ class RosetteSvgViewer(tk.Tk):
             angular = float(data.get("angular_feedrate", defaults["angular_feedrate"]))
             z_feed = float(data.get("z_feedrate", defaults["z_feedrate"]))
             sample_count = int(data.get("default_sample_count", defaults["default_sample_count"]))
-            if angular <= 0 or z_feed <= 0 or sample_count < 1:
+            fine_jog_feed = float(data.get("fine_jog_feedrate", defaults["fine_jog_feedrate"]))
+            if angular <= 0 or z_feed <= 0 or sample_count < 1 or fine_jog_feed <= 0:
                 raise ValueError
             invert_z = bool(data.get("invert_z_direction", defaults["invert_z_direction"]))
             return {
                 "angular_feedrate": angular,
                 "z_feedrate": z_feed,
                 "default_sample_count": sample_count,
+                "fine_jog_feedrate": fine_jog_feed,
                 "invert_z_direction": invert_z,
             }
         except Exception:
             return defaults
 
-    def _save_settings(self, angular_feedrate, z_feedrate, default_sample_count, invert_z_direction):
+    def _save_settings(
+        self,
+        angular_feedrate,
+        z_feedrate,
+        default_sample_count,
+        fine_jog_feedrate,
+        invert_z_direction,
+    ):
         data = {
             "angular_feedrate": float(angular_feedrate),
             "z_feedrate": float(z_feedrate),
             "default_sample_count": int(default_sample_count),
+            "fine_jog_feedrate": float(fine_jog_feedrate),
             "invert_z_direction": bool(invert_z_direction),
         }
         self._settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -927,16 +1261,26 @@ class RosetteSvgViewer(tk.Tk):
         except (AttributeError, ValueError):
             raise ValueError("Default Number of Samples must be a positive whole number.")
 
+    def _get_fine_jog_feedrate_from_settings_ui(self):
+        try:
+            fine_feedrate = float(self.fine_jog_feed_var.get())
+            if fine_feedrate <= 0:
+                raise ValueError
+            return fine_feedrate
+        except (AttributeError, ValueError):
+            raise ValueError("Fine Jog Feedrate must be a positive number.")
+
     def _on_save_settings(self):
         try:
             angular, z_feed = self._get_feedrates_from_ui()
             default_samples = self._get_default_sample_count_from_settings_ui()
+            fine_jog_feed = self._get_fine_jog_feedrate_from_settings_ui()
         except ValueError as exc:
             messagebox.showerror("Invalid Settings", str(exc))
             return
 
         try:
-            self._save_settings(angular, z_feed, default_samples, self.invert_z_var.get())
+            self._save_settings(angular, z_feed, default_samples, fine_jog_feed, self.invert_z_var.get())
             self.samples_var.set(str(default_samples))
             self.settings_status_var.set("Settings saved to settings.json")
         except OSError as exc:
@@ -1103,6 +1447,7 @@ class RosetteSvgViewer(tk.Tk):
         try:
             angular_feed, z_feed = self._get_feedrates_from_ui()
             default_samples = self._get_default_sample_count_from_settings_ui()
+            fine_jog_feed = self._get_fine_jog_feedrate_from_settings_ui()
         except ValueError as exc:
             messagebox.showerror("Invalid Settings", str(exc))
             return
@@ -1110,7 +1455,7 @@ class RosetteSvgViewer(tk.Tk):
         invert_z = self.invert_z_var.get()
 
         try:
-            self._save_settings(angular_feed, z_feed, default_samples, invert_z)
+            self._save_settings(angular_feed, z_feed, default_samples, fine_jog_feed, invert_z)
             self.settings_status_var.set("Settings saved to settings.json")
         except (AttributeError, OSError):
             # If settings UI is unavailable for any reason, continue generating gCode.
@@ -1181,6 +1526,11 @@ class RosetteSvgViewer(tk.Tk):
         self.serial_terminal.see(tk.END)
         self.serial_terminal.config(state=tk.DISABLED)
 
+    def _clear_serial_terminal(self):
+        self.serial_terminal.config(state=tk.NORMAL)
+        self.serial_terminal.delete("1.0", tk.END)
+        self.serial_terminal.config(state=tk.DISABLED)
+
     def _refresh_serial_ports(self):
         if list_ports is None:
             return
@@ -1211,6 +1561,7 @@ class RosetteSvgViewer(tk.Tk):
             self._serial_conn = serial.Serial(port=port, baudrate=115200, timeout=0)
             self.connect_serial_btn.config(text="Disconnect")
             self.serial_status_var.set(f"Connected: {port} @ 115200")
+            self._set_serial_send_enabled(True)
             self._append_serial_terminal(f"[Connected] {port} @ 115200\n")
             self._start_serial_polling()
         except Exception as exc:
@@ -1228,7 +1579,125 @@ class RosetteSvgViewer(tk.Tk):
         self._serial_conn = None
         self.connect_serial_btn.config(text="Connect")
         self.serial_status_var.set("Disconnected")
+        self._set_serial_send_enabled(False)
         self._append_serial_terminal("[Disconnected]\n")
+
+    def _set_serial_send_enabled(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.serial_send_entry.config(state=state)
+        self.serial_send_btn.config(state=state)
+        self.get_descriptions_btn.config(state=state)
+
+    def _on_serial_send_return(self, _event):
+        self._send_serial_text()
+        return "break"
+
+    def _send_serial_text(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+
+        text = self.serial_send_var.get()
+        if text == "":
+            return
+
+        payload = text if text.endswith("\n") else f"{text}\n"
+        try:
+            self._serial_conn.write(payload.encode("utf-8"))
+            self._append_serial_terminal(f"> {text}\n")
+            self.serial_send_var.set("")
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+
+    def _on_jog_axis(self, axis, direction):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+
+        try:
+            increment = float(self.jog_increment_var.get())
+            if increment <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Jog Increment", "Jog increment must be a positive number.")
+            return
+
+        delta = float(direction) * increment
+        mode = self.jog_mode_var.get()
+        if mode == "Fine":
+            try:
+                fine_feedrate = self._get_fine_jog_feedrate_from_settings_ui()
+            except ValueError:
+                fine_feedrate = float(self._settings.get("fine_jog_feedrate", 200.0))
+            command = f"G1 {axis}{delta:.4f} F{fine_feedrate:.4f}"
+        else:
+            command = f"G0 {axis}{delta:.4f}"
+
+        try:
+            for line in ("G91", command, "G90"):
+                self._serial_conn.write(f"{line}\n".encode("utf-8"))
+                self._append_serial_terminal(f"> {line}\n")
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+
+    def _on_home_axis(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+
+        axis_selection = self.home_axis_var.get()
+        
+        if axis_selection == "All":
+            command = "G0 X0 Z0 A0 B0"
+        else:
+            command = f"G0 {axis_selection}0"
+
+        try:
+            self._serial_conn.write(f"{command}\n".encode("utf-8"))
+            self._append_serial_terminal(f"> {command}\n")
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+
+    def _on_zero_axis(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+
+        axis_selection = self.home_axis_var.get()
+        
+        if axis_selection == "All":
+            command = "G92 X0 Z0 A0 B0"
+        else:
+            command = f"G92 {axis_selection}0"
+
+        try:
+            self._serial_conn.write(f"{command}\n".encode("utf-8"))
+            self._append_serial_terminal(f"> {command}\n")
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+
+    def _get_descriptions(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+
+        try:
+            for index in range(200,681):
+                command = f"$SED={index}\n"
+                self._serial_conn.write(command.encode("utf-8"))
+                self._append_serial_terminal(f"> $SED={index}\n")
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
 
     def _start_serial_polling(self):
         self._stop_serial_polling()
@@ -1249,7 +1718,23 @@ class RosetteSvgViewer(tk.Tk):
             if waiting > 0:
                 data = self._serial_conn.read(waiting)
                 if data:
-                    self._append_serial_terminal(data.decode("utf-8", errors="replace"))
+                    decoded = data.decode("utf-8", errors="replace")
+                    if self.suppress_idle_var.get():
+                        filtered_lines = []
+                        for line in decoded.splitlines(keepends=True):
+                            if line.lstrip("\r\n").startswith("<Idle"):
+                                continue
+                            filtered_lines.append(line)
+                        decoded = "".join(filtered_lines)
+                    if self.filter_ok_var.get() and decoded:
+                        filtered_lines = []
+                        for line in decoded.splitlines(keepends=True):
+                            if line.strip("\r\n") == "ok":
+                                continue
+                            filtered_lines.append(line)
+                        decoded = "".join(filtered_lines)
+                    if decoded:
+                        self._append_serial_terminal(decoded)
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
