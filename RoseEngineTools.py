@@ -26,6 +26,7 @@ except Exception:
 
 # Rotate the angular reference so 0° is at the top of the plot.
 ANGLE_OFFSET_DEG = 90.0
+GUI_BACKGROUND_COLOR = "#dff1ff"
 
 
 class RosetteSvgViewer(tk.Tk):
@@ -34,22 +35,37 @@ class RosetteSvgViewer(tk.Tk):
         self.title("Rose Engine Tools")
         #self.geometry("1150x760")
         self.minsize(960, 600)
+        self.configure(bg=GUI_BACKGROUND_COLOR)
 
         self._centered_polylines = None
         self._serial_conn = None
         self._serial_poll_job = None
+        self._serial_rx_buffer = ""
+        self._gcode_send_queue = []
+        self._gcode_send_waiting_ok = False
+        self._gcode_send_total = 0
+        self._gcode_send_sent = 0
         self._settings_path = Path(__file__).with_name("settings.json")
         self._settings = self._load_settings()
         self.invert_z_var = tk.BooleanVar(value=bool(self._settings.get("invert_z_direction", False)))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._configure_theme()
         self._build_ui()
         self._plot_empty_state()
+
+    def _configure_theme(self):
+        style = ttk.Style(self)
+        style.configure("TFrame", background=GUI_BACKGROUND_COLOR)
+        style.configure("TLabelframe", background=GUI_BACKGROUND_COLOR)
+        style.configure("TLabelframe.Label", background=GUI_BACKGROUND_COLOR)
+        style.configure("TLabel", background=GUI_BACKGROUND_COLOR)
+        style.configure("TNotebook", background=GUI_BACKGROUND_COLOR)
 
     def _build_ui(self):
         outer = ttk.Frame(self)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=GUI_BACKGROUND_COLOR)
         scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
         container = ttk.Frame(canvas, padding=10)
 
@@ -104,9 +120,12 @@ class RosetteSvgViewer(tk.Tk):
     def _build_plunge_tab(self, parent):
         frame = ttk.Frame(parent, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
 
-        controls = ttk.LabelFrame(frame, text="Plunge Controls", padding=10)
-        controls.pack(anchor=tk.NW, fill=tk.X)
+        controls = ttk.LabelFrame(frame, text="Plunge Controls", padding=10, width=320)
+        controls.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        controls.grid_propagate(False)
 
         def add_labeled_entry(parent_widget, label_text, text_var, pady=(10, 0)):
             row = ttk.Frame(parent_widget)
@@ -143,11 +162,180 @@ class RosetteSvgViewer(tk.Tk):
             controls,
             text="Rotate & Repeat",
             variable=self.plunge_rotate_repeat_var,
+            command=self._update_plunge_preview,
         ).pack(anchor=tk.W, pady=(10, 0))
 
         ttk.Button(controls, text="Generate gCode", command=self._on_generate_plunge_gcode).pack(
             fill=tk.X, pady=(12, 0)
         )
+
+        preview_frame = ttk.LabelFrame(frame, text="Cut Preview", padding=8)
+        preview_frame.grid(row=0, column=1, sticky="nsew")
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_frame.grid_columnconfigure(0, weight=1)
+
+        self.plunge_figure = Figure(figsize=(9, 5), dpi=100)
+        self.plunge_ax = self.plunge_figure.add_subplot(121)
+        self.plunge_polar_ax = self.plunge_figure.add_subplot(122, projection="polar")
+        self.plunge_canvas = FigureCanvasTkAgg(self.plunge_figure, master=preview_frame)
+        self.plunge_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        for variable in (
+            self.plunge_total_depth_var,
+            self.plunge_step_depth_var,
+            self.plunge_retract_depth_var,
+            self.plunge_safe_z_var,
+            self.plunge_x_advance_var,
+            self.plunge_number_of_cuts_var,
+            self.plunge_number_of_divisions_var,
+        ):
+            variable.trace_add("write", self._update_plunge_preview)
+        self._update_plunge_preview()
+
+    def _get_plunge_parameters(self):
+        total_depth = float(self.plunge_total_depth_var.get())
+        step_depth = float(self.plunge_step_depth_var.get())
+        retract_depth = float(self.plunge_retract_depth_var.get())
+        safe_z = float(self.plunge_safe_z_var.get())
+        x_advance = float(self.plunge_x_advance_var.get())
+        number_of_cuts = int(self.plunge_number_of_cuts_var.get())
+        feedrate = float(self.plunge_feedrate_var.get())
+        division_count = int(self.plunge_number_of_divisions_var.get())
+        if (
+            total_depth <= 0.0
+            or step_depth <= 0.0
+            or retract_depth < 0.0
+            or safe_z < 0.0
+            or x_advance < 0.0
+            or number_of_cuts < 1
+            or feedrate <= 0.0
+            or division_count < 1
+        ):
+            raise ValueError
+        return total_depth, step_depth, retract_depth, safe_z, x_advance, number_of_cuts, feedrate, division_count
+
+    def _build_plunge_depth_levels(self, total_depth, step_depth):
+        depth_levels = []
+        current_depth = step_depth
+        while current_depth < total_depth:
+            depth_levels.append(current_depth)
+            current_depth += step_depth
+        depth_levels.append(total_depth)
+        return depth_levels
+
+    def _update_plunge_preview(self, *_):
+        self.plunge_ax.clear()
+        self.plunge_polar_ax.clear()
+        self.plunge_ax.set_title("Plunge Cut Preview (X-Z)")
+        self.plunge_ax.set_xlabel("X (mm)")
+        self.plunge_ax.set_ylabel("Z (mm)")
+        self.plunge_ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
+
+        self.plunge_polar_ax.set_title("A-Axis Preview (Polar)")
+        self.plunge_polar_ax.set_theta_zero_location("N")
+        self.plunge_polar_ax.set_theta_direction(-1)
+        self.plunge_polar_ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
+
+        try:
+            total_depth, step_depth, retract_depth, safe_z, x_advance, number_of_cuts, _feedrate, division_count = (
+                self._get_plunge_parameters()
+            )
+            depth_levels = self._build_plunge_depth_levels(total_depth, step_depth)
+            x_positions = [cut_index * x_advance for cut_index in range(number_of_cuts)]
+            plunge_points_z = [-depth for depth in depth_levels]
+            rotate_repeat = self.plunge_rotate_repeat_var.get()
+            cut_iterations = division_count if rotate_repeat else 1
+            division_angle = 360.0 / float(division_count)
+
+            for x_target in x_positions:
+                self.plunge_ax.plot([x_target, x_target], [0.0, -total_depth], color="#1f77b4", linewidth=1.6)
+                self.plunge_ax.scatter(
+                    [x_target] * len(plunge_points_z),
+                    plunge_points_z,
+                    color="#ff7f0e",
+                    s=16,
+                    zorder=3,
+                )
+
+            self.plunge_ax.axhline(0.0, color="#666666", linewidth=1.0)
+            if retract_depth > 0.0:
+                self.plunge_ax.axhline(retract_depth, color="#2ca02c", linewidth=1.0, linestyle="--", label="Retract Z")
+            if safe_z > 0.0:
+                self.plunge_ax.axhline(safe_z, color="#7f7f7f", linewidth=1.0, linestyle="--", label="Safe Z")
+
+            x_extent = x_positions[-1] if x_positions else 0.0
+            x_margin = max(0.5, x_advance * 0.5)
+            z_top = max(safe_z, retract_depth, 0.0) + 0.5
+            z_bottom = -total_depth - 0.5
+            self.plunge_ax.set_xlim(-x_margin, x_extent + x_margin)
+            self.plunge_ax.set_ylim(z_bottom, z_top)
+
+            radial_positions = x_positions if x_positions else [0.0]
+            if radial_positions[-1] <= 0.0:
+                radial_positions = [index + 1.0 for index in range(number_of_cuts)]
+
+            theta_values = [math.radians(iteration * division_angle) for iteration in range(cut_iterations)]
+            for theta in theta_values:
+                self.plunge_polar_ax.plot(
+                    [theta, theta],
+                    [0.0, radial_positions[-1]],
+                    color="#d9d9d9",
+                    linewidth=0.8,
+                    zorder=1,
+                )
+
+            for radius in radial_positions:
+                self.plunge_polar_ax.scatter(
+                    theta_values,
+                    [radius] * len(theta_values),
+                    color="#1f77b4",
+                    s=16,
+                    zorder=3,
+                )
+
+            self.plunge_polar_ax.set_rlabel_position(135)
+            self.plunge_polar_ax.set_ylim(0.0, max(radial_positions[-1], 1.0) * 1.05)
+            if not rotate_repeat:
+                self.plunge_polar_ax.text(
+                    0.5,
+                    0.05,
+                    "Rotate & Repeat OFF",
+                    transform=self.plunge_polar_ax.transAxes,
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+            division_text = f"{division_count} groups" if rotate_repeat else "1 group"
+            self.plunge_ax.text(
+                0.02,
+                0.02,
+                f"Cuts: {number_of_cuts}\nPasses per cut: {len(depth_levels)}\nRotate & repeat: {division_text}",
+                transform=self.plunge_ax.transAxes,
+                va="bottom",
+                ha="left",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": "#bbbbbb"},
+            )
+        except Exception:
+            self.plunge_ax.text(
+                0.5,
+                0.5,
+                "Enter valid plunge values\n(cuts/divisions >= 1, positive depths)",
+                transform=self.plunge_ax.transAxes,
+                ha="center",
+                va="center",
+            )
+            self.plunge_polar_ax.text(
+                0.5,
+                0.5,
+                "Enter valid values",
+                transform=self.plunge_polar_ax.transAxes,
+                ha="center",
+                va="center",
+            )
+
+        self.plunge_canvas.draw_idle()
 
     def _build_spherical_sliderest_tab(self, parent):
         frame = ttk.Frame(parent, padding=12)
@@ -343,7 +531,7 @@ class RosetteSvgViewer(tk.Tk):
         left_panel_host.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         left_panel_host.grid_propagate(False)
 
-        left_canvas = tk.Canvas(left_panel_host, highlightthickness=0)
+        left_canvas = tk.Canvas(left_panel_host, highlightthickness=0, bg=GUI_BACKGROUND_COLOR)
         left_scrollbar = tk.Scrollbar(left_panel_host, orient=tk.VERTICAL, command=left_canvas.yview, width=14)
         left_panel = ttk.Frame(left_canvas, padding=10)
 
@@ -803,25 +991,9 @@ class RosetteSvgViewer(tk.Tk):
 
     def _on_generate_plunge_gcode(self):
         try:
-            total_depth = float(self.plunge_total_depth_var.get())
-            step_depth = float(self.plunge_step_depth_var.get())
-            retract_depth = float(self.plunge_retract_depth_var.get())
-            safe_z = float(self.plunge_safe_z_var.get())
-            x_advance = float(self.plunge_x_advance_var.get())
-            number_of_cuts = int(self.plunge_number_of_cuts_var.get())
-            feedrate = float(self.plunge_feedrate_var.get())
-            division_count = int(self.plunge_number_of_divisions_var.get())
-            if (
-                total_depth <= 0.0
-                or step_depth <= 0.0
-                or retract_depth < 0.0
-                or safe_z < 0.0
-                or x_advance < 0.0
-                or number_of_cuts < 1
-                or feedrate <= 0.0
-                or division_count < 1
-            ):
-                raise ValueError
+            total_depth, step_depth, retract_depth, safe_z, x_advance, number_of_cuts, feedrate, division_count = (
+                self._get_plunge_parameters()
+            )
         except ValueError:
             messagebox.showerror(
                 "Invalid Plunge Input",
@@ -832,12 +1004,7 @@ class RosetteSvgViewer(tk.Tk):
         rotate_repeat = self.plunge_rotate_repeat_var.get()
         cut_iterations = division_count if rotate_repeat else 1
         division_angle = 360.0 / float(division_count)
-        depth_levels = []
-        current_depth = step_depth
-        while current_depth < total_depth:
-            depth_levels.append(current_depth)
-            current_depth += step_depth
-        depth_levels.append(total_depth)
+        depth_levels = self._build_plunge_depth_levels(total_depth, step_depth)
 
         lines = [
             "; Plunge cut program",
@@ -1296,6 +1463,22 @@ class RosetteSvgViewer(tk.Tk):
         clear_btn = ttk.Button(toolbar, text="Clear", command=self._on_clear_gcode)
         clear_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.send_gcode_serial_btn = ttk.Button(
+            toolbar,
+            text="Send to Serial",
+            command=self._on_send_gcode_to_serial,
+            state=tk.DISABLED,
+        )
+        self.send_gcode_serial_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.stop_gcode_serial_btn = ttk.Button(
+            toolbar,
+            text="Stop Sending",
+            command=self._on_stop_gcode_send,
+            state=tk.DISABLED,
+        )
+        self.stop_gcode_serial_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         invert_chk = ttk.Checkbutton(
             toolbar,
             text="Invert Z Direction",
@@ -1520,6 +1703,80 @@ class RosetteSvgViewer(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save Error", f"Unable to save gCode: {exc}")
 
+    def _on_send_gcode_to_serial(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+        if self._gcode_send_queue or self._gcode_send_waiting_ok:
+            messagebox.showwarning("Send to Serial", "A gCode send is already in progress.")
+            return
+
+        gcode_text = self.gcode_text.get("1.0", tk.END)
+        lines_to_send = []
+        for line in gcode_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+            lines_to_send.append(stripped)
+
+        if not lines_to_send:
+            messagebox.showwarning("Send to Serial", "No executable gCode lines found.")
+            return
+
+        self._gcode_send_queue = list(lines_to_send)
+        self._gcode_send_total = len(lines_to_send)
+        self._gcode_send_sent = 0
+        self._gcode_send_waiting_ok = False
+        self.serial_status_var.set(f"Sending gCode 0/{self._gcode_send_total}")
+        self._append_serial_terminal(f"[gCode] Starting send: {self._gcode_send_total} lines\n")
+        self.send_gcode_serial_btn.config(state=tk.DISABLED)
+        self.stop_gcode_serial_btn.config(state=tk.NORMAL)
+        self._send_next_queued_gcode_line()
+
+    def _on_stop_gcode_send(self):
+        if not (self._gcode_send_queue or self._gcode_send_waiting_ok):
+            return
+        self.serial_status_var.set("gCode send stopped")
+        self._cancel_gcode_send("Stopped by user")
+
+    def _send_next_queued_gcode_line(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            self._cancel_gcode_send("Serial connection lost.")
+            return
+
+        if not self._gcode_send_queue:
+            self.serial_status_var.set(f"gCode send complete ({self._gcode_send_total} lines)")
+            self._append_serial_terminal(f"[gCode] Send complete: {self._gcode_send_total} lines\n")
+            self._gcode_send_total = 0
+            self._gcode_send_sent = 0
+            self._gcode_send_waiting_ok = False
+            self.send_gcode_serial_btn.config(state=tk.NORMAL)
+            self.stop_gcode_serial_btn.config(state=tk.DISABLED)
+            return
+
+        line = self._gcode_send_queue.pop(0)
+        try:
+            self._serial_conn.write(f"{line}\n".encode("utf-8"))
+            self._append_serial_terminal(f"> {line}\n")
+            self._gcode_send_waiting_ok = True
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+
+    def _cancel_gcode_send(self, reason):
+        if self._gcode_send_queue or self._gcode_send_waiting_ok:
+            self._append_serial_terminal(f"[gCode] Send canceled: {reason}\n")
+        self._gcode_send_queue.clear()
+        self._gcode_send_waiting_ok = False
+        self._gcode_send_total = 0
+        self._gcode_send_sent = 0
+        if hasattr(self, "send_gcode_serial_btn"):
+            state = tk.NORMAL if self._serial_conn is not None and self._serial_conn.is_open else tk.DISABLED
+            self.send_gcode_serial_btn.config(state=state)
+        if hasattr(self, "stop_gcode_serial_btn"):
+            self.stop_gcode_serial_btn.config(state=tk.DISABLED)
+
     def _append_serial_terminal(self, text):
         self.serial_terminal.config(state=tk.NORMAL)
         self.serial_terminal.insert(tk.END, text)
@@ -1559,6 +1816,7 @@ class RosetteSvgViewer(tk.Tk):
 
         try:
             self._serial_conn = serial.Serial(port=port, baudrate=115200, timeout=0)
+            self._serial_rx_buffer = ""
             self.connect_serial_btn.config(text="Disconnect")
             self.serial_status_var.set(f"Connected: {port} @ 115200")
             self._set_serial_send_enabled(True)
@@ -1570,6 +1828,8 @@ class RosetteSvgViewer(tk.Tk):
 
     def _disconnect_serial(self):
         self._stop_serial_polling()
+        self._cancel_gcode_send("Disconnected")
+        self._serial_rx_buffer = ""
         if self._serial_conn is not None:
             try:
                 if self._serial_conn.is_open:
@@ -1587,6 +1847,10 @@ class RosetteSvgViewer(tk.Tk):
         self.serial_send_entry.config(state=state)
         self.serial_send_btn.config(state=state)
         self.get_descriptions_btn.config(state=state)
+        if hasattr(self, "send_gcode_serial_btn"):
+            self.send_gcode_serial_btn.config(state=state)
+        if hasattr(self, "stop_gcode_serial_btn"):
+            self.stop_gcode_serial_btn.config(state=tk.DISABLED)
 
     def _on_serial_send_return(self, _event):
         self._send_serial_text()
@@ -1595,6 +1859,9 @@ class RosetteSvgViewer(tk.Tk):
     def _send_serial_text(self):
         if self._serial_conn is None or not self._serial_conn.is_open:
             messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+        if self._gcode_send_queue or self._gcode_send_waiting_ok:
+            messagebox.showwarning("Serial Busy", "Wait for the active gCode send to complete.")
             return
 
         text = self.serial_send_var.get()
@@ -1719,22 +1986,28 @@ class RosetteSvgViewer(tk.Tk):
                 data = self._serial_conn.read(waiting)
                 if data:
                     decoded = data.decode("utf-8", errors="replace")
-                    if self.suppress_idle_var.get():
-                        filtered_lines = []
-                        for line in decoded.splitlines(keepends=True):
-                            if line.lstrip("\r\n").startswith("<Idle"):
-                                continue
-                            filtered_lines.append(line)
-                        decoded = "".join(filtered_lines)
-                    if self.filter_ok_var.get() and decoded:
-                        filtered_lines = []
-                        for line in decoded.splitlines(keepends=True):
-                            if line.strip("\r\n") == "ok":
-                                continue
-                            filtered_lines.append(line)
-                        decoded = "".join(filtered_lines)
-                    if decoded:
-                        self._append_serial_terminal(decoded)
+                    self._serial_rx_buffer += decoded
+                    while "\n" in self._serial_rx_buffer:
+                        raw_line, self._serial_rx_buffer = self._serial_rx_buffer.split("\n", 1)
+                        line = raw_line.rstrip("\r")
+                        stripped_line = line.strip()
+
+                        if self._gcode_send_waiting_ok and stripped_line.lower() == "ok":
+                            self._gcode_send_waiting_ok = False
+                            self._gcode_send_sent += 1
+                            self.serial_status_var.set(
+                                f"Sending gCode {self._gcode_send_sent}/{self._gcode_send_total}"
+                            )
+                            self._send_next_queued_gcode_line()
+                        elif self._gcode_send_waiting_ok and stripped_line.lower().startswith("error"):
+                            self.serial_status_var.set(f"gCode error: {stripped_line}")
+                            self._cancel_gcode_send(stripped_line)
+
+                        if self.suppress_idle_var.get() and stripped_line.startswith("<Idle"):
+                            continue
+                        if self.filter_ok_var.get() and stripped_line == "ok":
+                            continue
+                        self._append_serial_terminal(f"{line}\n")
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")

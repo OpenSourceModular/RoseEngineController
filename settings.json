@@ -2,5 +2,6 @@
   "angular_feedrate": 1440.0,
   "z_feedrate": 1440.0,
   "default_sample_count": 720,
+  "fine_jog_feedrate": 200.0,
   "invert_z_direction": true
 }
