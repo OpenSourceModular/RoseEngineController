@@ -62,27 +62,8 @@ class RosetteSvgViewer(tk.Tk):
         style.configure("TNotebook", background=GUI_BACKGROUND_COLOR)
 
     def _build_ui(self):
-        outer = ttk.Frame(self)
-        outer.pack(fill=tk.BOTH, expand=True)
-
-        canvas = tk.Canvas(outer, highlightthickness=0, bg=GUI_BACKGROUND_COLOR)
-        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
-        container = ttk.Frame(canvas, padding=10)
-
-        container.bind(
-            "<Configure>",
-            lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-
-        container_window = canvas.create_window((0, 0), window=container, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.bind(
-            "<Configure>",
-            lambda event: canvas.itemconfigure(container_window, width=event.width),
-        )
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        container = ttk.Frame(self, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
 
         # ── Tab notebook ──────────────────────────────────────────────────────
         notebook = ttk.Notebook(container)
@@ -100,7 +81,7 @@ class RosetteSvgViewer(tk.Tk):
         notebook.add(reciprocator_tab, text="Reciprocator")
         notebook.add(plunge_tab, text="Plunge")
         notebook.add(spherical_sliderest_tab, text="Spherical Sliderest")
-        notebook.add(gcode_tab,    text="gCode Gen")
+        notebook.add(gcode_tab,    text="gCode")
         notebook.add(serial_tab,     text="Serial Terminal")
         notebook.add(settings_tab, text="Settings")
 
@@ -397,8 +378,13 @@ class RosetteSvgViewer(tk.Tk):
             variable=self.spherical_suppress_b_var,
         ).pack(anchor=tk.W, pady=(10, 0))
 
-        self.spherical_depth_of_cut_var = tk.StringVar(value="0.1")
-        add_labeled_entry(controls, "Depth of cut", self.spherical_depth_of_cut_var)
+        self.spherical_negative_z_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Negative Z",
+            variable=self.spherical_negative_z_var,
+            command=self._update_spherical_sliderest_preview,
+        ).pack(anchor=tk.W, pady=(10, 0))
 
         self.spherical_feedrate_var = tk.StringVar(value="200")
         add_labeled_entry(controls, "Feedrate", self.spherical_feedrate_var)
@@ -424,7 +410,6 @@ class RosetteSvgViewer(tk.Tk):
             self.spherical_b_end_var,
             self.spherical_radius_var,
             self.spherical_samples_var,
-            self.spherical_depth_of_cut_var,
         ):
             variable.trace_add("write", self._update_spherical_sliderest_preview)
         self.spherical_direction_var.trace_add("write", self._update_spherical_sliderest_preview)
@@ -434,21 +419,19 @@ class RosetteSvgViewer(tk.Tk):
         start_angle = float(self.spherical_b_start_var.get())
         end_angle = float(self.spherical_b_end_var.get())
         radius = float(self.spherical_radius_var.get())
-        depth_of_cut = float(self.spherical_depth_of_cut_var.get())
         feedrate = float(self.spherical_feedrate_var.get())
         sample_count = int(self.spherical_samples_var.get())
-        if radius <= 0.0 or depth_of_cut < 0.0 or feedrate <= 0.0 or sample_count < 2:
+        if radius <= 0.0 or feedrate <= 0.0 or sample_count < 2:
             raise ValueError
         direction = self.spherical_direction_var.get()
         x_sign = 1.0 if direction == "L-R" else -1.0
-        return start_angle, end_angle, radius, depth_of_cut, feedrate, sample_count, direction, x_sign
+        return start_angle, end_angle, radius, feedrate, sample_count, direction, x_sign
 
     def _build_spherical_sliderest_samples(
         self,
         start_angle,
         end_angle,
         radius,
-        depth_of_cut,
         sample_count,
         x_sign,
         invert_curve,
@@ -465,7 +448,7 @@ class RosetteSvgViewer(tk.Tk):
             if invert_curve:
                 x_arc_delta, z_arc_delta = z_arc_delta, x_arc_delta
             x_target = x_arc_delta
-            z_target = -depth_of_cut + z_arc_delta
+            z_target = z_arc_delta
             samples.append((current_angle, x_target, z_target))
         return samples
 
@@ -477,23 +460,35 @@ class RosetteSvgViewer(tk.Tk):
         self.spherical_ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.8)
 
         try:
-            start_angle, end_angle, radius, depth_of_cut, _feedrate, sample_count, direction, x_sign = (
+            start_angle, end_angle, radius, _feedrate, sample_count, direction, x_sign = (
                 self._get_spherical_sliderest_parameters()
             )
             samples = self._build_spherical_sliderest_samples(
                 start_angle,
                 end_angle,
                 radius,
-                depth_of_cut,
                 sample_count,
                 x_sign,
                 self.spherical_curve_inverted_var.get(),
             )
             x_values = [sample[1] for sample in samples]
-            z_values = [sample[2] for sample in samples]
+            if self.spherical_negative_z_var.get():
+                z_values = [-abs(sample[2]) for sample in samples]
+            else:
+                z_values = [sample[2] for sample in samples]
             self.spherical_ax.plot(x_values, z_values, color="#1f77b4", linewidth=1.8)
             self.spherical_ax.scatter([x_values[0]], [z_values[0]], color="#2ca02c", label="Start", zorder=3)
             self.spherical_ax.scatter([x_values[-1]], [z_values[-1]], color="#d62728", label="End", zorder=3)
+
+            z_min = min(z_values)
+            z_max = max(z_values)
+            z_span = max(abs(z_min), abs(z_max), 0.1)
+            z_margin = z_span * 0.05
+            if z_max <= 0.0:
+                self.spherical_ax.set_ylim(0.0, z_min - z_margin)
+            else:
+                self.spherical_ax.set_ylim(0.0, z_max + z_margin)
+
             self.spherical_ax.set_aspect("equal", adjustable="box")
             self.spherical_ax.legend(loc="best")
             self.spherical_ax.text(
@@ -987,7 +982,6 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
         self.gcode_text.insert(tk.END, output)
-        self.gcode_text.config(state=tk.DISABLED)
 
     def _on_generate_plunge_gcode(self):
         try:
@@ -1047,17 +1041,16 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
         self.gcode_text.insert(tk.END, output)
-        self.gcode_text.config(state=tk.DISABLED)
 
     def _on_generate_spherical_sliderest_gcode(self):
         try:
-            start_angle, end_angle, radius, depth_of_cut, feedrate, sample_count, direction, x_sign = (
+            start_angle, end_angle, radius, feedrate, sample_count, direction, x_sign = (
                 self._get_spherical_sliderest_parameters()
             )
         except ValueError:
             messagebox.showerror(
                 "Invalid Spherical Sliderest Input",
-                "Radius and feedrate must be positive. Depth of cut must be zero or greater. Samples must be 2 or more.",
+                "Radius and feedrate must be positive. Samples must be 2 or more.",
             )
             return
 
@@ -1065,7 +1058,6 @@ class RosetteSvgViewer(tk.Tk):
             start_angle,
             end_angle,
             radius,
-            depth_of_cut,
             sample_count,
             x_sign,
             self.spherical_curve_inverted_var.get(),
@@ -1078,16 +1070,19 @@ class RosetteSvgViewer(tk.Tk):
             "G90 ; absolute positioning",
             "M3 S100",
             f"; b_start_deg={start_angle:.4f} b_end_deg={end_angle:.4f}",
-            f"; radius_mm={radius:.4f} depth_of_cut_mm={depth_of_cut:.4f}",
+            f"; radius_mm={radius:.4f}",
             f"; direction={direction} x_sign={x_sign:+.0f}",
             f"; curve_inverted_xz_diagonal={self.spherical_curve_inverted_var.get()}",
             f"; feedrate={feedrate:.4f}",
             f"; samples={sample_count}",
             f"; suppress_b_axis_move={suppress_b}",
+            f"; negative_z={self.spherical_negative_z_var.get()}",
             "; assumes X0 Z0 at cut start and B is already at starting angle",
         ]
 
         for current_angle, x_target, z_target in samples:
+            if self.spherical_negative_z_var.get():
+                z_target = -abs(z_target)
             if suppress_b:
                 lines.append(f"G1 X{x_target:.4f} Z{z_target:.4f} F{feedrate:.4f}")
             else:
@@ -1101,7 +1096,6 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
         self.gcode_text.insert(tk.END, output)
-        self.gcode_text.config(state=tk.DISABLED)
 
     def _build_serial_tab(self, parent):
         frame = ttk.Frame(parent, padding=10)
@@ -1182,21 +1176,50 @@ class RosetteSvgViewer(tk.Tk):
 
         ttk.Label(left_panel, text="Jog Controls").pack(anchor=tk.W)
 
+        _img_dir = Path(__file__).parent
+        self._jog_img_up    = tk.PhotoImage(file=_img_dir / "UpArrow.png")
+        self._jog_img_down  = tk.PhotoImage(file=_img_dir / "DownArrow.png")
+        self._jog_img_left  = tk.PhotoImage(file=_img_dir / "LeftArrow.png")
+        self._jog_img_right = tk.PhotoImage(file=_img_dir / "RightArrow.png")
+        self._jog_img_rotate_left = tk.PhotoImage(file=_img_dir / "RotateLeft.png")
+        self._jog_img_rotate_right = tk.PhotoImage(file=_img_dir / "RotateRight.png")
+
         jog_frame = ttk.Frame(left_panel)
         jog_frame.pack(anchor=tk.N, pady=(12, 0))
 
-        ttk.Button(jog_frame, text="Z+", width=8, command=lambda: self._on_jog_axis("Z", +1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_up,    command=lambda: self._on_jog_axis("Z", +1)).grid(
             row=0, column=1, padx=4, pady=4
         )
-        ttk.Button(jog_frame, text="X-", width=8, command=lambda: self._on_jog_axis("X", -1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_left,  command=lambda: self._on_jog_axis("X", -1)).grid(
             row=1, column=0, padx=4, pady=4
         )
         ttk.Label(jog_frame, text="XYZ").grid(row=1, column=1, padx=4, pady=4)
-        ttk.Button(jog_frame, text="X+", width=8, command=lambda: self._on_jog_axis("X", +1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_right, command=lambda: self._on_jog_axis("X", +1)).grid(
             row=1, column=2, padx=4, pady=4
         )
-        ttk.Button(jog_frame, text="Z-", width=8, command=lambda: self._on_jog_axis("Z", -1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_down,  command=lambda: self._on_jog_axis("Z", -1)).grid(
             row=2, column=1, padx=4, pady=4
+        )
+
+        rotate_frame = ttk.Frame(left_panel)
+        rotate_frame.pack(anchor=tk.W, pady=(8, 0))
+
+        a_group = ttk.LabelFrame(rotate_frame, text="A Axis", padding=6)
+        a_group.grid(row=0, column=0, padx=(0, 8), pady=0, sticky=tk.NW)
+        ttk.Button(a_group, image=self._jog_img_rotate_left, command=lambda: self._on_jog_axis("A", -1)).grid(
+            row=0, column=0, padx=4, pady=4
+        )
+        ttk.Button(a_group, image=self._jog_img_rotate_right, command=lambda: self._on_jog_axis("A", +1)).grid(
+            row=0, column=1, padx=4, pady=4
+        )
+
+        b_group = ttk.LabelFrame(rotate_frame, text="B Axis", padding=6)
+        b_group.grid(row=0, column=1, padx=0, pady=0, sticky=tk.NW)
+        ttk.Button(b_group, image=self._jog_img_rotate_left, command=lambda: self._on_jog_axis("B", -1)).grid(
+            row=0, column=0, padx=4, pady=4
+        )
+        ttk.Button(b_group, image=self._jog_img_rotate_right, command=lambda: self._on_jog_axis("B", +1)).grid(
+            row=0, column=1, padx=4, pady=4
         )
 
         ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
@@ -1213,14 +1236,14 @@ class RosetteSvgViewer(tk.Tk):
             row=0, column=1, padx=4, pady=2, sticky=tk.W
         )
         ttk.Radiobutton(increment_frame, text="5", value="5", variable=self.jog_increment_var).grid(
-            row=1, column=0, padx=4, pady=2, sticky=tk.W
+            row=0, column=2, padx=4, pady=2, sticky=tk.W
         )
         ttk.Radiobutton(increment_frame, text="10", value="10", variable=self.jog_increment_var).grid(
-            row=1, column=1, padx=4, pady=2, sticky=tk.W
+            row=0, column=3, padx=4, pady=2, sticky=tk.W
         )
 
-        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
-        ttk.Label(left_panel, text="Jog Mode").pack(anchor=tk.W)
+        #ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
+        ttk.Label(left_panel, text="Jog Speed").pack(anchor=tk.W)
 
         self.jog_mode_var = tk.StringVar(value="Rapid")
         jog_mode_frame = ttk.Frame(left_panel)
@@ -1229,31 +1252,14 @@ class RosetteSvgViewer(tk.Tk):
         ttk.Radiobutton(jog_mode_frame, text="Rapid", value="Rapid", variable=self.jog_mode_var).grid(
             row=0, column=0, padx=4, pady=2, sticky=tk.W
         )
-        ttk.Radiobutton(jog_mode_frame, text="Fine", value="Fine", variable=self.jog_mode_var).grid(
+        ttk.Radiobutton(jog_mode_frame, text="Slow", value="Fine", variable=self.jog_mode_var).grid(
             row=0, column=1, padx=4, pady=2, sticky=tk.W
         )
 
-        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
-        ttk.Label(left_panel, text="Rotation").pack(anchor=tk.W)
 
-        rotate_frame = ttk.Frame(left_panel)
-        rotate_frame.pack(anchor=tk.N, pady=(8, 0))
-
-        ttk.Button(rotate_frame, text="A-", width=8, command=lambda: self._on_jog_axis("A", -1)).grid(
-            row=0, column=0, padx=4, pady=4
-        )
-        ttk.Button(rotate_frame, text="A+", width=8, command=lambda: self._on_jog_axis("A", +1)).grid(
-            row=0, column=1, padx=4, pady=4
-        )
-        ttk.Button(rotate_frame, text="B-", width=8, command=lambda: self._on_jog_axis("B", -1)).grid(
-            row=1, column=0, padx=4, pady=4
-        )
-        ttk.Button(rotate_frame, text="B+", width=8, command=lambda: self._on_jog_axis("B", +1)).grid(
-            row=1, column=1, padx=4, pady=4
-        )
 
         ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
-        ttk.Label(left_panel, text="Home").pack(anchor=tk.W)
+        ttk.Label(left_panel, text="Home / Zero").pack(anchor=tk.W)
 
         self.home_axis_var = tk.StringVar(value="All")
         home_frame = ttk.Frame(left_panel)
@@ -1266,21 +1272,23 @@ class RosetteSvgViewer(tk.Tk):
             row=0, column=1, padx=4, pady=2, sticky=tk.W
         )
         ttk.Radiobutton(home_frame, text="A", value="A", variable=self.home_axis_var).grid(
-            row=1, column=0, padx=4, pady=2, sticky=tk.W
+            row=0, column=2, padx=4, pady=2, sticky=tk.W
         )
         ttk.Radiobutton(home_frame, text="B", value="B", variable=self.home_axis_var).grid(
-            row=1, column=1, padx=4, pady=2, sticky=tk.W
+            row=0, column=3, padx=4, pady=2, sticky=tk.W
         )
         ttk.Radiobutton(home_frame, text="All", value="All", variable=self.home_axis_var).grid(
-            row=2, column=0, columnspan=2, padx=4, pady=2, sticky=tk.W
+            row=0, column=4, columnspan=2, padx=4, pady=2, sticky=tk.W
         )
 
-        ttk.Button(left_panel, text="Home", command=self._on_home_axis).pack(fill=tk.X, pady=(8, 0))
-
-        ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(14, 10))
-        ttk.Label(left_panel, text="Zero").pack(anchor=tk.W)
-
-        ttk.Button(left_panel, text="Zero", command=self._on_zero_axis).pack(fill=tk.X, pady=(8, 0))
+        home_zero_row = ttk.Frame(left_panel)
+        home_zero_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(home_zero_row, text="Home", command=self._on_home_axis).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        ttk.Button(home_zero_row, text="Zero", command=self._on_zero_axis).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0)
+        )
 
         if serial is None:
             self.serial_status_var.set("pyserial not installed")
@@ -1489,9 +1497,37 @@ class RosetteSvgViewer(tk.Tk):
         body = ttk.Frame(parent, padding=(6, 6, 6, 6))
         body.pack(fill=tk.BOTH, expand=True)
 
+        right_panel = ttk.LabelFrame(body, text="Find / Replace", padding=8, width=260)
+        right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        right_panel.pack_propagate(False)
+
+        self.gcode_find_var = tk.StringVar(value="")
+        self.gcode_replace_var = tk.StringVar(value="")
+        self.gcode_find_match_case_var = tk.BooleanVar(value=False)
+        self.gcode_find_status_var = tk.StringVar(value="Ready")
+
+        ttk.Label(right_panel, text="Find").pack(anchor=tk.W)
+        ttk.Entry(right_panel, textvariable=self.gcode_find_var).pack(fill=tk.X, pady=(4, 8))
+
+        ttk.Label(right_panel, text="Replace").pack(anchor=tk.W)
+        ttk.Entry(right_panel, textvariable=self.gcode_replace_var).pack(fill=tk.X, pady=(4, 8))
+
+        ttk.Checkbutton(
+            right_panel,
+            text="Match case",
+            variable=self.gcode_find_match_case_var,
+        ).pack(anchor=tk.W)
+
+        ttk.Button(right_panel, text="Find Next", command=self._on_find_next_gcode).pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(right_panel, text="Replace", command=self._on_replace_gcode).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(right_panel, text="Replace All", command=self._on_replace_all_gcode).pack(fill=tk.X, pady=(6, 0))
+
+        ttk.Separator(right_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 8))
+        ttk.Label(right_panel, textvariable=self.gcode_find_status_var, wraplength=220).pack(anchor=tk.W)
+
         self.gcode_text = scrolledtext.ScrolledText(
             body,
-            state=tk.DISABLED,
+            state=tk.NORMAL,
             wrap=tk.NONE,
             font=("Courier", 10),
         )
@@ -1674,12 +1710,10 @@ class RosetteSvgViewer(tk.Tk):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
         self.gcode_text.insert(tk.END, output)
-        self.gcode_text.config(state=tk.DISABLED)
 
     def _on_clear_gcode(self):
         self.gcode_text.config(state=tk.NORMAL)
         self.gcode_text.delete("1.0", tk.END)
-        self.gcode_text.config(state=tk.DISABLED)
 
     def _on_save_gcode(self):
         output = self.gcode_text.get("1.0", tk.END)
@@ -1702,6 +1736,108 @@ class RosetteSvgViewer(tk.Tk):
             Path(file_path).write_text(output, encoding="utf-8")
         except OSError as exc:
             messagebox.showerror("Save Error", f"Unable to save gCode: {exc}")
+
+    def _find_gcode_match(self, start_index):
+        find_text = self.gcode_find_var.get()
+        if not find_text:
+            self.gcode_find_status_var.set("Enter text to find.")
+            return None
+
+        search_kwargs = {}
+        if not self.gcode_find_match_case_var.get():
+            search_kwargs["nocase"] = 1
+
+        match_index = self.gcode_text.search(find_text, start_index, stopindex=tk.END, **search_kwargs)
+        if not match_index:
+            match_index = self.gcode_text.search(find_text, "1.0", stopindex=start_index, **search_kwargs)
+
+        return match_index
+
+    def _on_find_next_gcode(self):
+        start_index = self.gcode_text.index("insert+1c")
+        match_index = self._find_gcode_match(start_index)
+        if not match_index:
+            self.gcode_find_status_var.set("No matches found.")
+            return
+
+        find_text = self.gcode_find_var.get()
+        end_index = f"{match_index}+{len(find_text)}c"
+        self.gcode_text.tag_remove(tk.SEL, "1.0", tk.END)
+        self.gcode_text.tag_add(tk.SEL, match_index, end_index)
+        self.gcode_text.mark_set(tk.INSERT, end_index)
+        self.gcode_text.see(match_index)
+        self.gcode_text.focus_set()
+
+        line_number = match_index.split(".")[0]
+        self.gcode_find_status_var.set(f"Match found at line {line_number}.")
+
+    def _on_replace_gcode(self):
+        find_text = self.gcode_find_var.get()
+        replace_text = self.gcode_replace_var.get()
+        if not find_text:
+            self.gcode_find_status_var.set("Enter text to find.")
+            return
+
+        selected_text = ""
+        try:
+            selected_text = self.gcode_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            pass
+
+        if self.gcode_find_match_case_var.get():
+            is_selected_match = selected_text == find_text
+        else:
+            is_selected_match = selected_text.lower() == find_text.lower()
+
+        if not is_selected_match:
+            self._on_find_next_gcode()
+            try:
+                selected_text = self.gcode_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                selected_text = ""
+            if self.gcode_find_match_case_var.get():
+                is_selected_match = selected_text == find_text
+            else:
+                is_selected_match = selected_text.lower() == find_text.lower()
+
+        if not is_selected_match:
+            self.gcode_find_status_var.set("No match selected to replace.")
+            return
+
+        self.gcode_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        insert_at = self.gcode_text.index(tk.INSERT)
+        self.gcode_text.insert(insert_at, replace_text)
+        new_end = f"{insert_at}+{len(replace_text)}c"
+        self.gcode_text.tag_remove(tk.SEL, "1.0", tk.END)
+        self.gcode_text.tag_add(tk.SEL, insert_at, new_end)
+        self.gcode_text.mark_set(tk.INSERT, new_end)
+        self.gcode_text.see(insert_at)
+        self.gcode_find_status_var.set("Replaced 1 match.")
+
+    def _on_replace_all_gcode(self):
+        find_text = self.gcode_find_var.get()
+        replace_text = self.gcode_replace_var.get()
+        if not find_text:
+            self.gcode_find_status_var.set("Enter text to find.")
+            return
+
+        search_kwargs = {}
+        if not self.gcode_find_match_case_var.get():
+            search_kwargs["nocase"] = 1
+
+        count = 0
+        start_index = "1.0"
+        while True:
+            match_index = self.gcode_text.search(find_text, start_index, stopindex=tk.END, **search_kwargs)
+            if not match_index:
+                break
+            end_index = f"{match_index}+{len(find_text)}c"
+            self.gcode_text.delete(match_index, end_index)
+            self.gcode_text.insert(match_index, replace_text)
+            count += 1
+            start_index = f"{match_index}+{len(replace_text)}c"
+
+        self.gcode_find_status_var.set(f"Replaced {count} matches.")
 
     def _on_send_gcode_to_serial(self):
         if self._serial_conn is None or not self._serial_conn.is_open:
