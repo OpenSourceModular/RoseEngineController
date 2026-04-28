@@ -27,6 +27,18 @@ except Exception:
 # Rotate the angular reference so 0° is at the top of the plot.
 ANGLE_OFFSET_DEG = 90.0
 GUI_BACKGROUND_COLOR = "#dff1ff"
+DUMMY_SERIAL_PORT = "Dummy"
+
+
+class DummySerialConnection:
+    def __init__(self):
+        self.is_open = True
+
+    def write(self, data):
+        return len(data)
+
+    def close(self):
+        self.is_open = False
 
 
 class RosetteSvgViewer(tk.Tk):
@@ -39,6 +51,7 @@ class RosetteSvgViewer(tk.Tk):
 
         self._centered_polylines = None
         self._serial_conn = None
+        self._serial_dummy_mode = False
         self._serial_poll_job = None
         self._serial_rx_buffer = ""
         self._gcode_send_queue = []
@@ -68,10 +81,12 @@ class RosetteSvgViewer(tk.Tk):
         # ── Tab notebook ──────────────────────────────────────────────────────
         notebook = ttk.Notebook(container)
         notebook.pack(fill=tk.BOTH, expand=True)
+        self._notebook = notebook
 
         svg_tab      = ttk.Frame(notebook)
         gcode_tab    = ttk.Frame(notebook)
         serial_tab     = ttk.Frame(notebook)
+        self._serial_tab = serial_tab
         reciprocator_tab = ttk.Frame(notebook)
         plunge_tab = ttk.Frame(notebook)
         spherical_sliderest_tab = ttk.Frame(notebook)
@@ -92,6 +107,8 @@ class RosetteSvgViewer(tk.Tk):
         self._build_plunge_tab(plunge_tab)
         self._build_spherical_sliderest_tab(spherical_sliderest_tab)
         self._build_settings_tab(settings_tab)
+
+        self.bind("<KeyPress>", self._on_key_jog)
 
     def _build_placeholder_tab(self, parent, name):
         ttk.Label(parent, text=f"{name} — coming soon", font=("TkDefaultFont", 11)).pack(
@@ -1170,6 +1187,35 @@ class RosetteSvgViewer(tk.Tk):
         self.serial_send_btn.pack(side=tk.LEFT)
         self._set_serial_send_enabled(False)
 
+        position_panel = ttk.LabelFrame(body, text="Position", padding=10, width=170)
+        position_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        position_panel.pack_propagate(False)
+
+        self.position_x_var = tk.StringVar(value="0.0000")
+        self.position_z_var = tk.StringVar(value="0.0000")
+        self.position_a_var = tk.StringVar(value="0.0000")
+        self.position_b_var = tk.StringVar(value="0.0000")
+
+        ttk.Label(position_panel, text="X").pack(anchor=tk.W)
+        ttk.Entry(position_panel, textvariable=self.position_x_var, state="readonly", width=14).pack(
+            fill=tk.X, pady=(2, 8)
+        )
+
+        ttk.Label(position_panel, text="Z").pack(anchor=tk.W)
+        ttk.Entry(position_panel, textvariable=self.position_z_var, state="readonly", width=14).pack(
+            fill=tk.X, pady=(2, 8)
+        )
+
+        ttk.Label(position_panel, text="A").pack(anchor=tk.W)
+        ttk.Entry(position_panel, textvariable=self.position_a_var, state="readonly", width=14).pack(
+            fill=tk.X, pady=(2, 8)
+        )
+
+        ttk.Label(position_panel, text="B").pack(anchor=tk.W)
+        ttk.Entry(position_panel, textvariable=self.position_b_var, state="readonly", width=14).pack(
+            fill=tk.X, pady=(2, 0)
+        )
+
         left_panel = ttk.LabelFrame(body, text="Controls", padding=10, width=250)
         left_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         left_panel.pack_propagate(False)
@@ -1187,7 +1233,7 @@ class RosetteSvgViewer(tk.Tk):
         jog_frame = ttk.Frame(left_panel)
         jog_frame.pack(anchor=tk.N, pady=(12, 0))
 
-        ttk.Button(jog_frame, image=self._jog_img_up,    command=lambda: self._on_jog_axis("Z", +1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_up,    command=lambda: self._on_jog_axis("Z", -1)).grid(
             row=0, column=1, padx=4, pady=4
         )
         ttk.Button(jog_frame, image=self._jog_img_left,  command=lambda: self._on_jog_axis("X", -1)).grid(
@@ -1197,7 +1243,7 @@ class RosetteSvgViewer(tk.Tk):
         ttk.Button(jog_frame, image=self._jog_img_right, command=lambda: self._on_jog_axis("X", +1)).grid(
             row=1, column=2, padx=4, pady=4
         )
-        ttk.Button(jog_frame, image=self._jog_img_down,  command=lambda: self._on_jog_axis("Z", -1)).grid(
+        ttk.Button(jog_frame, image=self._jog_img_down,  command=lambda: self._on_jog_axis("Z", +1)).grid(
             row=2, column=1, padx=4, pady=4
         )
 
@@ -1291,11 +1337,8 @@ class RosetteSvgViewer(tk.Tk):
         )
 
         if serial is None:
-            self.serial_status_var.set("pyserial not installed")
-            self.refresh_ports_btn.config(state=tk.DISABLED)
-            self.connect_serial_btn.config(state=tk.DISABLED)
-            self._append_serial_terminal("[Error] pyserial is required. Install with: pip install pyserial\n")
-            return
+            self.serial_status_var.set("pyserial not installed (Dummy available)")
+            self._append_serial_terminal("[Info] pyserial not installed. Dummy port mode is available for testing.\n")
 
         self._refresh_serial_ports()
 
@@ -1880,6 +1923,20 @@ class RosetteSvgViewer(tk.Tk):
             self._cancel_gcode_send("Serial connection lost.")
             return
 
+        if self._serial_dummy_mode:
+            while self._gcode_send_queue:
+                line = self._gcode_send_queue.pop(0)
+                self._append_sent_command(line)
+                self._gcode_send_sent += 1
+            self.serial_status_var.set(f"gCode send complete ({self._gcode_send_total} lines)")
+            self._append_serial_terminal(f"[gCode] Send complete: {self._gcode_send_total} lines\n")
+            self._gcode_send_total = 0
+            self._gcode_send_sent = 0
+            self._gcode_send_waiting_ok = False
+            self.send_gcode_serial_btn.config(state=tk.NORMAL)
+            self.stop_gcode_serial_btn.config(state=tk.DISABLED)
+            return
+
         if not self._gcode_send_queue:
             self.serial_status_var.set(f"gCode send complete ({self._gcode_send_total} lines)")
             self._append_serial_terminal(f"[gCode] Send complete: {self._gcode_send_total} lines\n")
@@ -1893,7 +1950,7 @@ class RosetteSvgViewer(tk.Tk):
         line = self._gcode_send_queue.pop(0)
         try:
             self._serial_conn.write(f"{line}\n".encode("utf-8"))
-            self._append_serial_terminal(f"> {line}\n")
+            self._append_sent_command(line)
             self._gcode_send_waiting_ok = True
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
@@ -1919,21 +1976,29 @@ class RosetteSvgViewer(tk.Tk):
         self.serial_terminal.see(tk.END)
         self.serial_terminal.config(state=tk.DISABLED)
 
+    def _append_sent_command(self, command):
+        prefix = "[DUMMY] >" if self._serial_dummy_mode else ">"
+        self._append_serial_terminal(f"{prefix} {command}\n")
+
     def _clear_serial_terminal(self):
         self.serial_terminal.config(state=tk.NORMAL)
         self.serial_terminal.delete("1.0", tk.END)
         self.serial_terminal.config(state=tk.DISABLED)
 
     def _refresh_serial_ports(self):
-        if list_ports is None:
-            return
-        ports = [port.device for port in list_ports.comports()]
+        ports = []
+        if list_ports is not None:
+            ports = [port.device for port in list_ports.comports()]
+        ports = [DUMMY_SERIAL_PORT] + ports
         self.serial_port_combo["values"] = ports
 
         if ports:
             if self.serial_port_var.get() not in ports:
                 self.serial_port_var.set(ports[0])
-            self.serial_status_var.set(f"Found {len(ports)} port(s)")
+            if ports == [DUMMY_SERIAL_PORT]:
+                self.serial_status_var.set("Dummy port available")
+            else:
+                self.serial_status_var.set(f"Found {len(ports) - 1} serial port(s) + Dummy")
         else:
             self.serial_port_var.set("")
             self.serial_status_var.set("No serial ports found")
@@ -1950,8 +2015,23 @@ class RosetteSvgViewer(tk.Tk):
             messagebox.showwarning("Serial Port", "Select a serial port first.")
             return
 
+        if port == DUMMY_SERIAL_PORT:
+            self._serial_conn = DummySerialConnection()
+            self._serial_dummy_mode = True
+            self._serial_rx_buffer = ""
+            self.connect_serial_btn.config(text="Disconnect")
+            self.serial_status_var.set("Connected: Dummy")
+            self._set_serial_send_enabled(True)
+            self._append_serial_terminal("[Connected] Dummy mode (echo only)\n")
+            return
+
+        if serial is None:
+            messagebox.showerror("Serial Connection", "pyserial is not installed. Select Dummy for testing.")
+            return
+
         try:
             self._serial_conn = serial.Serial(port=port, baudrate=115200, timeout=0)
+            self._serial_dummy_mode = False
             self._serial_rx_buffer = ""
             self.connect_serial_btn.config(text="Disconnect")
             self.serial_status_var.set(f"Connected: {port} @ 115200")
@@ -1966,6 +2046,7 @@ class RosetteSvgViewer(tk.Tk):
         self._stop_serial_polling()
         self._cancel_gcode_send("Disconnected")
         self._serial_rx_buffer = ""
+        self._serial_dummy_mode = False
         if self._serial_conn is not None:
             try:
                 if self._serial_conn.is_open:
@@ -2007,12 +2088,52 @@ class RosetteSvgViewer(tk.Tk):
         payload = text if text.endswith("\n") else f"{text}\n"
         try:
             self._serial_conn.write(payload.encode("utf-8"))
-            self._append_serial_terminal(f"> {text}\n")
+            self._append_sent_command(text)
             self.serial_send_var.set("")
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
             self._disconnect_serial()
+
+    def _on_key_jog(self, event):
+        """Handle arrow-key jog when the Serial Terminal tab is active."""
+        # Ignore if a text-entry widget has focus (user may be typing).
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Entry, tk.Text, scrolledtext.ScrolledText)):
+            return
+        # Only act when the serial tab is the visible tab.
+        if self._notebook.select() != str(self._serial_tab):
+            return
+        arrow_map = {
+            "Left":  ("X", -1),
+            "Right": ("X", +1),
+            "Up":    ("Z", -1),
+            "Down":  ("Z", +1),
+        }
+        punctuation_char_map = {
+            ",": ("A", -1),
+            ".": ("A", +1),
+            "[": ("B", -1),
+            "]": ("B", +1),
+        }
+        punctuation_keysym_map = {
+            "comma": ("A", -1),
+            "period": ("A", +1),
+            "bracketleft": ("B", -1),
+            "bracketright": ("B", +1),
+        }
+
+        axis_direction = arrow_map.get(event.keysym)
+        if axis_direction is None and event.char:
+            axis_direction = punctuation_char_map.get(event.char)
+        if axis_direction is None:
+            axis_direction = punctuation_keysym_map.get(event.keysym)
+        if axis_direction is None:
+            return
+
+        axis, direction = axis_direction
+        self._on_jog_axis(axis, direction)
+        return "break"
 
     def _on_jog_axis(self, axis, direction):
         if self._serial_conn is None or not self._serial_conn.is_open:
@@ -2041,7 +2162,7 @@ class RosetteSvgViewer(tk.Tk):
         try:
             for line in ("G91", command, "G90"):
                 self._serial_conn.write(f"{line}\n".encode("utf-8"))
-                self._append_serial_terminal(f"> {line}\n")
+                self._append_sent_command(line)
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
@@ -2061,7 +2182,7 @@ class RosetteSvgViewer(tk.Tk):
 
         try:
             self._serial_conn.write(f"{command}\n".encode("utf-8"))
-            self._append_serial_terminal(f"> {command}\n")
+            self._append_sent_command(command)
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
@@ -2081,7 +2202,7 @@ class RosetteSvgViewer(tk.Tk):
 
         try:
             self._serial_conn.write(f"{command}\n".encode("utf-8"))
-            self._append_serial_terminal(f"> {command}\n")
+            self._append_sent_command(command)
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
@@ -2096,7 +2217,7 @@ class RosetteSvgViewer(tk.Tk):
             for index in range(200,681):
                 command = f"$SED={index}\n"
                 self._serial_conn.write(command.encode("utf-8"))
-                self._append_serial_terminal(f"> $SED={index}\n")
+                self._append_sent_command(f"$SED={index}")
         except Exception as exc:
             self.serial_status_var.set(f"Serial error: {exc}")
             self._append_serial_terminal(f"\n[Error] {exc}\n")
