@@ -58,6 +58,12 @@ class RosetteSvgViewer(tk.Tk):
         self._gcode_send_waiting_ok = False
         self._gcode_send_total = 0
         self._gcode_send_sent = 0
+        self._continuous_rosette_lines = []
+        self._continuous_rosette_index = 0
+        self._continuous_rosette_waiting_ok = False
+        self._continuous_rosette_job = None
+        self._continuous_injected_queue = []
+        self._continuous_last_sent_was_injected = False
         self._settings_path = Path(__file__).with_name("settings.json")
         self._settings = self._load_settings()
         self.invert_z_var = tk.BooleanVar(value=bool(self._settings.get("invert_z_direction", False)))
@@ -1172,6 +1178,7 @@ class RosetteSvgViewer(tk.Tk):
             wrap=tk.NONE,
             font=("Courier", 10),
         )
+        self.serial_terminal.tag_configure("jog_injected", foreground="#1f4db8")
         self.serial_terminal.pack(fill=tk.BOTH, expand=True)
 
         send_row = ttk.Frame(terminal_frame)
@@ -1215,6 +1222,41 @@ class RosetteSvgViewer(tk.Tk):
         ttk.Entry(position_panel, textvariable=self.position_b_var, state="readonly", width=14).pack(
             fill=tk.X, pady=(2, 0)
         )
+
+        continuous_panel = ttk.LabelFrame(body, text="Continuous", padding=10, width=170)
+        continuous_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        continuous_panel.pack_propagate(False)
+
+        self.run_rosette_btn = ttk.Button(
+            continuous_panel,
+            text="Run Rosette",
+            command=self._on_run_rosette_continuous,
+        )
+        self.run_rosette_btn.pack(fill=tk.X)
+
+        self.stop_rosette_btn = ttk.Button(
+            continuous_panel,
+            text="Stop",
+            command=self._on_stop_rosette_continuous,
+            state=tk.DISABLED,
+        )
+        self.stop_rosette_btn.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(continuous_panel, text="Last A Sent").pack(anchor=tk.W, pady=(10, 0))
+        self.continuous_last_a_var = tk.StringVar(value="—")
+        ttk.Entry(
+            continuous_panel,
+            textvariable=self.continuous_last_a_var,
+            state="readonly",
+            width=14,
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        self.continuous_beep_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            continuous_panel,
+            text="Beep",
+            variable=self.continuous_beep_var,
+        ).pack(anchor=tk.W, pady=(10, 0))
 
         left_panel = ttk.LabelFrame(body, text="Controls", padding=10, width=250)
         left_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
@@ -1886,6 +1928,9 @@ class RosetteSvgViewer(tk.Tk):
         if self._serial_conn is None or not self._serial_conn.is_open:
             messagebox.showwarning("Serial Port", "Connect to a serial port first.")
             return
+        if self._continuous_rosette_lines or self._continuous_rosette_waiting_ok:
+            messagebox.showwarning("Send to Serial", "Continuous Run Rosette is active. Stop it first.")
+            return
         if self._gcode_send_queue or self._gcode_send_waiting_ok:
             messagebox.showwarning("Send to Serial", "A gCode send is already in progress.")
             return
@@ -1970,15 +2015,139 @@ class RosetteSvgViewer(tk.Tk):
         if hasattr(self, "stop_gcode_serial_btn"):
             self.stop_gcode_serial_btn.config(state=tk.DISABLED)
 
-    def _append_serial_terminal(self, text):
+    def _cancel_continuous_rosette(self, reason):
+        if self._continuous_rosette_job is not None:
+            self.after_cancel(self._continuous_rosette_job)
+            self._continuous_rosette_job = None
+
+        was_running = bool(self._continuous_rosette_lines) or self._continuous_rosette_waiting_ok
+        self._continuous_rosette_lines = []
+        self._continuous_rosette_index = 0
+        self._continuous_rosette_waiting_ok = False
+        self._continuous_injected_queue = []
+        self._continuous_last_sent_was_injected = False
+
+        if was_running:
+            self._append_serial_terminal(f"[Continuous] Stopped: {reason}\n")
+
+        if hasattr(self, "run_rosette_btn"):
+            run_state = tk.NORMAL if self._serial_conn is not None and self._serial_conn.is_open else tk.DISABLED
+            self.run_rosette_btn.config(state=run_state)
+        if hasattr(self, "stop_rosette_btn"):
+            self.stop_rosette_btn.config(state=tk.DISABLED)
+
+    def _on_run_rosette_continuous(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+        if self._gcode_send_queue or self._gcode_send_waiting_ok:
+            messagebox.showwarning("Run Rosette", "A normal gCode send is active. Stop it first.")
+            return
+        if self._continuous_rosette_lines or self._continuous_rosette_waiting_ok:
+            messagebox.showinfo("Run Rosette", "Continuous run is already active.")
+            return
+
+        gcode_text = self.gcode_text.get("1.0", tk.END)
+        lines_to_send = []
+        for line in gcode_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.upper().startswith("G1"):
+                lines_to_send.append(stripped)
+
+        if not lines_to_send:
+            messagebox.showwarning("Run Rosette", "No G1 commands were found in the gCode tab.")
+            return
+
+        self._continuous_rosette_lines = lines_to_send
+        self._continuous_rosette_index = 0
+        self._continuous_rosette_waiting_ok = False
+        self._continuous_injected_queue = []
+        self._continuous_last_sent_was_injected = False
+        self.serial_status_var.set(f"Run Rosette: 1/{len(lines_to_send)}")
+        self._append_serial_terminal(
+            f"[Continuous] Starting Run Rosette: {len(lines_to_send)} G1 lines (looped)\n"
+        )
+        self.run_rosette_btn.config(state=tk.DISABLED)
+        self.stop_rosette_btn.config(state=tk.NORMAL)
+        self._send_next_continuous_rosette_line()
+
+    def _on_stop_rosette_continuous(self):
+        if not (self._continuous_rosette_lines or self._continuous_rosette_waiting_ok):
+            return
+        self.serial_status_var.set("Run Rosette stopped")
+        self._cancel_continuous_rosette("Stopped by user")
+
+    def _send_next_continuous_rosette_line(self):
+        if self._serial_conn is None or not self._serial_conn.is_open:
+            self._cancel_continuous_rosette("Serial connection lost.")
+            return
+
+        if not self._continuous_rosette_lines:
+            self._cancel_continuous_rosette("No lines to send.")
+            return
+
+        send_injected = False
+        injected_blue = False
+        if self._continuous_injected_queue:
+            line, injected_blue = self._continuous_injected_queue.pop(0)
+            send_injected = True
+        else:
+            line = self._continuous_rosette_lines[self._continuous_rosette_index]
+        try:
+            self._serial_conn.write(f"{line}\n".encode("utf-8"))
+            self._append_sent_command(line, blue=injected_blue)
+            if not send_injected:
+                tokens = line.split()
+                for token in tokens:
+                    upper = token.upper()
+                    if upper.startswith("A") and len(token) > 1:
+                        try:
+                            a_value = float(token[1:])
+                            self.continuous_last_a_var.set(f"{a_value:.4f}")
+                        except ValueError:
+                            pass
+                        break
+            self._continuous_last_sent_was_injected = send_injected
+            self._continuous_rosette_waiting_ok = True
+            if send_injected:
+                self.serial_status_var.set("Run Rosette: sending queued jog command")
+            else:
+                self.serial_status_var.set(
+                    f"Run Rosette: {self._continuous_rosette_index + 1}/{len(self._continuous_rosette_lines)}"
+                )
+        except Exception as exc:
+            self.serial_status_var.set(f"Serial error: {exc}")
+            self._append_serial_terminal(f"\n[Error] {exc}\n")
+            self._disconnect_serial()
+            return
+
+        if self._serial_dummy_mode:
+            self._continuous_rosette_waiting_ok = False
+            if not self._continuous_last_sent_was_injected:
+                reached_end = self._continuous_rosette_index == (len(self._continuous_rosette_lines) - 1)
+                self._continuous_rosette_index = (
+                    (self._continuous_rosette_index + 1) % len(self._continuous_rosette_lines)
+                )
+                if reached_end and self.continuous_beep_var.get():
+                    self.bell()
+            self._continuous_last_sent_was_injected = False
+            self._continuous_rosette_job = self.after(50, self._send_next_continuous_rosette_line)
+
+    def _append_serial_terminal(self, text, tag=None):
         self.serial_terminal.config(state=tk.NORMAL)
-        self.serial_terminal.insert(tk.END, text)
+        if tag is None:
+            self.serial_terminal.insert(tk.END, text)
+        else:
+            self.serial_terminal.insert(tk.END, text, tag)
         self.serial_terminal.see(tk.END)
         self.serial_terminal.config(state=tk.DISABLED)
 
-    def _append_sent_command(self, command):
+    def _append_sent_command(self, command, blue=False):
         prefix = "[DUMMY] >" if self._serial_dummy_mode else ">"
-        self._append_serial_terminal(f"{prefix} {command}\n")
+        tag = "jog_injected" if blue else None
+        self._append_serial_terminal(f"{prefix} {command}\n", tag=tag)
 
     def _clear_serial_terminal(self):
         self.serial_terminal.config(state=tk.NORMAL)
@@ -2045,6 +2214,7 @@ class RosetteSvgViewer(tk.Tk):
     def _disconnect_serial(self):
         self._stop_serial_polling()
         self._cancel_gcode_send("Disconnected")
+        self._cancel_continuous_rosette("Disconnected")
         self._serial_rx_buffer = ""
         self._serial_dummy_mode = False
         if self._serial_conn is not None:
@@ -2068,6 +2238,10 @@ class RosetteSvgViewer(tk.Tk):
             self.send_gcode_serial_btn.config(state=state)
         if hasattr(self, "stop_gcode_serial_btn"):
             self.stop_gcode_serial_btn.config(state=tk.DISABLED)
+        if hasattr(self, "run_rosette_btn"):
+            self.run_rosette_btn.config(state=state)
+        if hasattr(self, "stop_rosette_btn"):
+            self.stop_rosette_btn.config(state=tk.DISABLED)
 
     def _on_serial_send_return(self, _event):
         self._send_serial_text()
@@ -2076,6 +2250,9 @@ class RosetteSvgViewer(tk.Tk):
     def _send_serial_text(self):
         if self._serial_conn is None or not self._serial_conn.is_open:
             messagebox.showwarning("Serial Port", "Connect to a serial port first.")
+            return
+        if self._continuous_rosette_lines or self._continuous_rosette_waiting_ok:
+            messagebox.showwarning("Serial Busy", "Stop Run Rosette continuous mode first.")
             return
         if self._gcode_send_queue or self._gcode_send_waiting_ok:
             messagebox.showwarning("Serial Busy", "Wait for the active gCode send to complete.")
@@ -2158,6 +2335,20 @@ class RosetteSvgViewer(tk.Tk):
             command = f"G1 {axis}{delta:.4f} F{fine_feedrate:.4f}"
         else:
             command = f"G0 {axis}{delta:.4f}"
+
+        if self._continuous_rosette_lines or self._continuous_rosette_waiting_ok:
+            if axis not in {"X", "Z"}:
+                messagebox.showwarning("Jog During Run Rosette", "Only X and Z jog are available during Run Rosette.")
+                return
+            self._continuous_injected_queue.extend([
+                ("G91", False),
+                (command, True),
+                ("G90", False),
+            ])
+            self._append_serial_terminal(f"[Continuous] Queued jog: {command}\n")
+            if not self._continuous_rosette_waiting_ok:
+                self._send_next_continuous_rosette_line()
+            return
 
         try:
             for line in ("G91", command, "G90"):
@@ -2259,6 +2450,22 @@ class RosetteSvgViewer(tk.Tk):
                         elif self._gcode_send_waiting_ok and stripped_line.lower().startswith("error"):
                             self.serial_status_var.set(f"gCode error: {stripped_line}")
                             self._cancel_gcode_send(stripped_line)
+
+                        if self._continuous_rosette_waiting_ok and stripped_line.lower() == "ok":
+                            self._continuous_rosette_waiting_ok = False
+                            if self._continuous_rosette_lines:
+                                if not self._continuous_last_sent_was_injected:
+                                    reached_end = self._continuous_rosette_index == (len(self._continuous_rosette_lines) - 1)
+                                    self._continuous_rosette_index = (
+                                        (self._continuous_rosette_index + 1) % len(self._continuous_rosette_lines)
+                                    )
+                                    if reached_end and self.continuous_beep_var.get():
+                                        self.bell()
+                                self._continuous_last_sent_was_injected = False
+                                self._send_next_continuous_rosette_line()
+                        elif self._continuous_rosette_waiting_ok and stripped_line.lower().startswith("error"):
+                            self.serial_status_var.set(f"Run Rosette error: {stripped_line}")
+                            self._cancel_continuous_rosette(stripped_line)
 
                         if self.suppress_idle_var.get() and stripped_line.startswith("<Idle"):
                             continue
